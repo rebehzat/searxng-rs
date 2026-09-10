@@ -27,6 +27,9 @@ searxng-rs search "rust" --engine wikipedia --timeout-secs 15
 
 # List configured engines
 searxng-rs engines
+
+# Emit a tool schema for agent registration
+searxng-rs schema
 ```
 
 Results from an unavailable engine are reported in `engines[].error`; one backend failure does not discard successful results from other backends.
