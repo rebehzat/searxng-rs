@@ -1,6 +1,7 @@
 //! Engine abstraction and the built-in registry.
 
 pub mod duckduckgo;
+pub mod json_api;
 pub mod wikipedia;
 
 use std::time::Duration;
@@ -49,8 +50,11 @@ pub fn build_engine(
             user_agent,
             &cfg.string_param("language", "en"),
         ))),
+        "json_api" => Ok(Box::new(json_api::JsonApi::from_config(
+            name, cfg, user_agent,
+        )?)),
         other => Err(anyhow::anyhow!(
-            "engine '{name}' has unknown type '{other}' (supported: duckduckgo_html, wikipedia)"
+            "engine '{name}' has unknown type '{other}' (supported: duckduckgo_html, wikipedia, json_api)"
         )),
     }
 }

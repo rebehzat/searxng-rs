@@ -72,6 +72,14 @@ language = "en"
 [engines.ddg_html]
 type = "duckduckgo_html"
 region = "wt-wt"
+
+# Documented JSON APIs can be configured without recompiling.
+[engines.example_api]
+type = "json_api"
+endpoint = "https://api.example.invalid/search"
+query_param = "q"
+api_key_env = "EXAMPLE_API_KEY"
+api_key_header = "Authorization"
 ```
 
 ## Responsible fetching

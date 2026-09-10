@@ -12,6 +12,7 @@ A complete rewrite cannot be safely or accurately generated in one pass. The ups
 - TOML engine configuration
 - Wikipedia MediaWiki API adapter
 - DuckDuckGo HTML adapter with block/challenge reporting
+- Configurable JSON API adapter with environment-based API-key support
 - Unit tests and AGPL-3.0-or-later licensing
 
 ## Planned gates
