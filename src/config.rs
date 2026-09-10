@@ -70,10 +70,13 @@ pub struct Config {
     pub engines: BTreeMap<String, EngineConfig>,
 }
 
+/// One builtin engine definition: (name, backend, options).
+type EngineDefinition<'a> = (&'a str, &'a str, Vec<(&'a str, &'a str)>);
+
 impl Config {
     /// The configuration used when no file is present.
     pub fn builtin_defaults() -> Self {
-        let definitions: Vec<(&str, &str, Vec<(&str, &str)>)> = vec![
+        let definitions: Vec<EngineDefinition<'_>> = vec![
             ("ddg_html", "duckduckgo_html", vec![("region", "wt-wt")]),
             ("wikipedia", "wikipedia", vec![("language", "en")]),
             (
