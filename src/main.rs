@@ -47,6 +47,8 @@ enum Command {
     Search(SearchArgs),
     /// List configured engines and their adapter types.
     Engines,
+    /// Print a tool schema for OpenClaw/pi-style adapters.
+    Schema,
 }
 
 #[derive(Debug, Parser)]
@@ -119,6 +121,27 @@ async fn main() -> Result<()> {
                 })
                 .collect();
             println!("{}", serde_json::to_string_pretty(&infos)?);
+        }
+        Some(Command::Schema) => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "name": "searxng_search",
+                    "description": "Search configured public providers and return normalized results.",
+                    "command": "searxng-rs --agent",
+                    "input_schema": {
+                        "type": "object",
+                        "required": ["query"],
+                        "properties": {
+                            "id": {"description": "Opaque correlation value echoed in the response"},
+                            "query": {"type": "string"},
+                            "engines": {"type": "array", "items": {"type": "string"}},
+                            "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                            "timeout_secs": {"type": "integer", "minimum": 1, "maximum": 120}
+                        }
+                    }
+                }))?
+            );
         }
         None => {
             let mut command = Cli::command();
