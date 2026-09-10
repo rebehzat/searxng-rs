@@ -77,6 +77,61 @@ impl Config {
     /// The configuration used when no file is present.
     pub fn builtin_defaults() -> Self {
         let definitions: Vec<EngineDefinition<'_>> = vec![
+            (
+                "bing",
+                "html_scrape",
+                vec![
+                    ("endpoint", "https://www.bing.com/search"),
+                    ("query_param", "q"),
+                    ("result_selector", "li.b_algo"),
+                    ("link_selector", "h2 a"),
+                    ("snippet_selector", ".b_caption p"),
+                ],
+            ),
+            (
+                "google_html",
+                "html_scrape",
+                vec![
+                    ("endpoint", "https://www.google.com/search"),
+                    ("query_param", "q"),
+                    ("result_selector", "div.g"),
+                    ("link_selector", "a"),
+                    ("snippet_selector", "div.VwiC3b"),
+                ],
+            ),
+            (
+                "brave",
+                "html_scrape",
+                vec![
+                    ("endpoint", "https://search.brave.com/search"),
+                    ("query_param", "q"),
+                    ("result_selector", ".snippet"),
+                    ("link_selector", "a.source"),
+                    ("snippet_selector", ".generic-snippet"),
+                ],
+            ),
+            (
+                "startpage",
+                "html_scrape",
+                vec![
+                    ("endpoint", "https://www.startpage.com/sp/search"),
+                    ("query_param", "query"),
+                    ("result_selector", ".w-gl__result"),
+                    ("link_selector", "a.w-gl__result-title"),
+                    ("snippet_selector", "p.w-gl__description"),
+                ],
+            ),
+            (
+                "mojeek",
+                "html_scrape",
+                vec![
+                    ("endpoint", "https://www.mojeek.com/search"),
+                    ("query_param", "q"),
+                    ("result_selector", "ul.results-standard li"),
+                    ("link_selector", "a.title"),
+                    ("snippet_selector", "p.s"),
+                ],
+            ),
             ("ddg_html", "duckduckgo_html", vec![("region", "wt-wt")]),
             ("wikipedia", "wikipedia", vec![("language", "en")]),
             (

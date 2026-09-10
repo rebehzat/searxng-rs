@@ -1,6 +1,7 @@
 //! Engine abstraction and the built-in registry.
 
 pub mod duckduckgo;
+pub mod html_scrape;
 pub mod json_api;
 pub mod wikipedia;
 
@@ -50,11 +51,14 @@ pub fn build_engine(
             user_agent,
             &cfg.string_param("language", "en"),
         ))),
+        "html_scrape" => Ok(Box::new(html_scrape::HtmlScrape::from_config(
+            name, cfg, user_agent,
+        )?)),
         "json_api" => Ok(Box::new(json_api::JsonApi::from_config(
             name, cfg, user_agent,
         )?)),
         other => Err(anyhow::anyhow!(
-            "engine '{name}' has unknown type '{other}' (supported: duckduckgo_html, wikipedia, json_api)"
+            "engine '{name}' has unknown type '{other}' (supported: duckduckgo_html, wikipedia, html_scrape, json_api)"
         )),
     }
 }
