@@ -73,30 +73,142 @@ pub struct Config {
 impl Config {
     /// The configuration used when no file is present.
     pub fn builtin_defaults() -> Self {
-        let engines = [
+        let definitions: Vec<(&str, &str, Vec<(&str, &str)>)> = vec![
+            ("ddg_html", "duckduckgo_html", vec![("region", "wt-wt")]),
+            ("wikipedia", "wikipedia", vec![("language", "en")]),
             (
-                "ddg_html",
-                "duckduckgo_html",
-                [("region".to_string(), toml::Value::from("wt-wt"))],
+                "openalex",
+                "json_api",
+                vec![
+                    ("endpoint", "https://api.openalex.org/works"),
+                    ("query_param", "search"),
+                    ("limit_param", "per-page"),
+                    ("results_path", "results"),
+                    ("title_field", "title"),
+                    ("url_field", "doi"),
+                ],
             ),
             (
-                "wikipedia",
-                "wikipedia",
-                [("language".to_string(), toml::Value::from("en"))],
+                "crossref",
+                "json_api",
+                vec![
+                    ("endpoint", "https://api.crossref.org/works"),
+                    ("query_param", "query.bibliographic"),
+                    ("limit_param", "rows"),
+                    ("results_path", "message.items"),
+                    ("title_field", "title"),
+                    ("url_field", "URL"),
+                    ("snippet_field", "abstract"),
+                ],
             ),
-        ]
-        .into_iter()
-        .map(|(name, ty, params)| {
             (
-                name.to_string(),
-                EngineConfig {
-                    engine_type: ty.to_string(),
-                    enabled: true,
-                    params: params.into_iter().collect(),
-                },
-            )
-        })
-        .collect();
+                "semantic_scholar",
+                "json_api",
+                vec![
+                    (
+                        "endpoint",
+                        "https://api.semanticscholar.org/graph/v1/paper/search?fields=title,url,abstract",
+                    ),
+                    ("query_param", "query"),
+                    ("limit_param", "limit"),
+                    ("results_path", "data"),
+                    ("title_field", "title"),
+                    ("url_field", "url"),
+                    ("snippet_field", "abstract"),
+                ],
+            ),
+            (
+                "stackoverflow",
+                "json_api",
+                vec![
+                    (
+                        "endpoint",
+                        "https://api.stackexchange.com/2.3/search/advanced?site=stackoverflow&order=desc&sort=relevance",
+                    ),
+                    ("query_param", "q"),
+                    ("limit_param", "pagesize"),
+                    ("results_path", "items"),
+                    ("title_field", "title"),
+                    ("url_field", "link"),
+                    ("snippet_field", "excerpt"),
+                ],
+            ),
+            (
+                "openlibrary",
+                "json_api",
+                vec![
+                    ("endpoint", "https://openlibrary.org/search.json"),
+                    ("query_param", "q"),
+                    ("limit_param", "limit"),
+                    ("results_path", "docs"),
+                    ("title_field", "title"),
+                    ("url_field", "key"),
+                    ("url_prefix", "https://openlibrary.org"),
+                ],
+            ),
+            (
+                "internet_archive",
+                "json_api",
+                vec![
+                    (
+                        "endpoint",
+                        "https://archive.org/advancedsearch.php?output=json&fl[]=identifier&fl[]=title&fl[]=description",
+                    ),
+                    ("query_param", "q"),
+                    ("limit_param", "rows"),
+                    ("results_path", "response.docs"),
+                    ("title_field", "title"),
+                    ("url_field", "identifier"),
+                    ("url_prefix", "https://archive.org/details"),
+                    ("snippet_field", "description"),
+                ],
+            ),
+            (
+                "github_repositories",
+                "json_api",
+                vec![
+                    ("endpoint", "https://api.github.com/search/repositories"),
+                    ("query_param", "q"),
+                    ("limit_param", "per_page"),
+                    ("results_path", "items"),
+                    ("title_field", "full_name"),
+                    ("url_field", "html_url"),
+                    ("snippet_field", "description"),
+                ],
+            ),
+            (
+                "hacker_news",
+                "json_api",
+                vec![
+                    (
+                        "endpoint",
+                        "https://hn.algolia.com/api/v1/search?tags=story",
+                    ),
+                    ("query_param", "query"),
+                    ("limit_param", "hitsPerPage"),
+                    ("results_path", "hits"),
+                    ("title_field", "title"),
+                    ("url_field", "url"),
+                    ("snippet_field", "story_text"),
+                ],
+            ),
+        ];
+        let engines = definitions
+            .into_iter()
+            .map(|(name, ty, params)| {
+                (
+                    name.to_string(),
+                    EngineConfig {
+                        engine_type: ty.to_string(),
+                        enabled: true,
+                        params: params
+                            .into_iter()
+                            .map(|(k, v)| (k.to_string(), toml::Value::from(v)))
+                            .collect(),
+                    },
+                )
+            })
+            .collect();
 
         Self {
             settings: Settings::default(),

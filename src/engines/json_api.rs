@@ -1,10 +1,9 @@
-//! Configurable JSON search adapter for documented provider APIs.
+//! Configurable JSON adapter for documented provider APIs.
 //!
-//! The adapter expects an endpoint that accepts a query parameter and returns
-//! either an array of objects or an object containing `results`/`items`.
-//! Field names and optional API-key environment variables are configurable.
-//! It performs ordinary authenticated requests only; it does not bypass
-//! provider controls.
+//! Providers may expose results under a dotted path such as `message.items`;
+//! result fields may also be dotted (`primary_location.landing_page_url`).
+//! This adapter performs ordinary public or API-key-authenticated requests;
+//! it never circumvents provider controls.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -22,8 +21,11 @@ pub struct JsonApi {
     client: reqwest::Client,
     endpoint: String,
     query_param: String,
+    limit_param: Option<String>,
+    results_path: Option<String>,
     title_field: String,
     url_field: String,
+    url_prefix: String,
     snippet_field: String,
     api_key: Option<(String, String)>,
 }
@@ -41,21 +43,29 @@ impl JsonApi {
                 .map(|value| (cfg.string_param("api_key_header", "Authorization"), value)),
             _ => None,
         };
+        let limit_param = cfg.string_param("limit_param", "").trim().to_owned();
         Ok(Self {
             name: name.into(),
             client: reqwest::Client::builder().user_agent(user_agent).build()?,
             endpoint,
             query_param: cfg.string_param("query_param", "q"),
+            limit_param: (!limit_param.is_empty()).then_some(limit_param),
+            results_path: (!cfg.string_param("results_path", "").is_empty())
+                .then(|| cfg.string_param("results_path", "")),
             title_field: cfg.string_param("title_field", "title"),
             url_field: cfg.string_param("url_field", "url"),
+            url_prefix: cfg.string_param("url_prefix", ""),
             snippet_field: cfg.string_param("snippet_field", "snippet"),
             api_key,
         })
     }
 
     fn parse_value(&self, value: Value, limit: usize) -> Vec<SearchResult> {
-        let candidates = value
-            .get("results")
+        let candidates = self
+            .results_path
+            .as_deref()
+            .and_then(|path| value_at(&value, path))
+            .or_else(|| value.get("results"))
             .or_else(|| value.get("items"))
             .unwrap_or(&value);
         let Some(items) = candidates.as_array() else {
@@ -65,15 +75,15 @@ impl JsonApi {
             .iter()
             .take(limit)
             .filter_map(|item| {
-                let title = item.get(&self.title_field)?.as_str()?.trim();
-                let url = item.get(&self.url_field)?.as_str()?.trim();
+                let title = text_at(item, &self.title_field)?;
+                let mut url = text_at(item, &self.url_field)?;
+                if !self.url_prefix.is_empty() && url.starts_with('/') {
+                    url = format!("{}{}", self.url_prefix.trim_end_matches('/'), url);
+                }
                 if title.is_empty() || url.is_empty() {
                     return None;
                 }
-                let snippet = item
-                    .get(&self.snippet_field)
-                    .and_then(Value::as_str)
-                    .map(str::to_owned);
+                let snippet = text_at(item, &self.snippet_field).filter(|s| !s.is_empty());
                 Some(SearchResult::with_metadata(
                     self.name.clone(),
                     title,
@@ -98,10 +108,14 @@ impl Engine for JsonApi {
         limit: usize,
         timeout: Duration,
     ) -> EngineResult<Vec<SearchResult>> {
+        let mut params = vec![(self.query_param.clone(), query.to_owned())];
+        if let Some(limit_param) = &self.limit_param {
+            params.push((limit_param.clone(), limit.to_string()));
+        }
         let mut request = self
             .client
             .get(&self.endpoint)
-            .query(&[(self.query_param.as_str(), query)])
+            .query(&params)
             .timeout(timeout);
         if let Some((header, value)) = &self.api_key {
             request = request.header(header, value);
@@ -112,36 +126,74 @@ impl Engine for JsonApi {
     }
 }
 
+fn value_at<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
+    path.split('.')
+        .filter(|part| !part.is_empty())
+        .try_fold(value, |current, part| current.get(part))
+}
+
+fn text_at(value: &Value, path: &str) -> Option<String> {
+    let value = value_at(value, path)?;
+    value.as_str().map(str::to_owned).or_else(|| {
+        value
+            .as_array()?
+            .iter()
+            .find_map(Value::as_str)
+            .map(str::to_owned)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn parses_results_and_items_shapes() {
-        let cfg = EngineConfig {
+    fn config(params: &[(&str, &str)]) -> EngineConfig {
+        EngineConfig {
             engine_type: "json_api".into(),
             enabled: true,
-            params: [(
-                "endpoint".into(),
-                toml::Value::String("https://example.test".into()),
-            )]
-            .into_iter()
-            .collect(),
-        };
-        let e = JsonApi::from_config("api", &cfg, "test/1").unwrap();
-        let value: Value = serde_json::json!({"results": [{"title": "Rust", "url": "https://rust-lang.org", "snippet": "safe"}]});
+            params: params
+                .iter()
+                .map(|(k, v)| ((*k).into(), toml::Value::String((*v).into())))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn parses_nested_results_and_fields() {
+        let e = JsonApi::from_config(
+            "api",
+            &config(&[
+                ("endpoint", "https://example.test"),
+                ("results_path", "message.items"),
+                ("title_field", "title"),
+                ("url_field", "links.html"),
+            ]),
+            "test/1",
+        )
+        .unwrap();
+        let value = serde_json::json!({"message":{"items":[{"title":["Rust"],"links":{"html":"https://rust-lang.org"}}]}});
         let results = e.parse_value(value, 5);
         assert_eq!(results[0].title, "Rust");
-        assert_eq!(results[0].snippet.as_deref(), Some("safe"));
+        assert_eq!(results[0].url, "https://rust-lang.org");
+    }
+
+    #[test]
+    fn applies_url_prefix() {
+        let e = JsonApi::from_config(
+            "api",
+            &config(&[
+                ("endpoint", "https://example.test"),
+                ("url_prefix", "https://example.test"),
+            ]),
+            "test/1",
+        )
+        .unwrap();
+        let results = e.parse_value(serde_json::json!({"results":[{"title":"A","url":"/a"}]}), 1);
+        assert_eq!(results[0].url, "https://example.test/a");
     }
 
     #[test]
     fn missing_endpoint_is_rejected() {
-        let cfg = EngineConfig {
-            engine_type: "json_api".into(),
-            enabled: true,
-            params: HashMap::new().into_iter().collect(),
-        };
-        assert!(JsonApi::from_config("api", &cfg, "test/1").is_err());
+        assert!(JsonApi::from_config("api", &config(&[]), "test/1").is_err());
     }
 }
