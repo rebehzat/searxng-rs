@@ -1,0 +1,14 @@
+[settings]
+timeout_secs = 10
+max_concurrent = 4
+user_agent = "searxng-rs/0.1 (+https://github.com/rebehzat/searxng-rs)"
+
+[engines.wikipedia]
+type = "wikipedia"
+language = "en"
+enabled = true
+
+[engines.ddg_html]
+type = "duckduckgo_html"
+region = "wt-wt"
+enabled = true
