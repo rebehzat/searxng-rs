@@ -13,7 +13,7 @@ A complete rewrite cannot be safely or accurately generated in one pass. The ups
 - Wikipedia MediaWiki API adapter
 - DuckDuckGo HTML adapter with block/challenge reporting
 - Configurable JSON API adapter with environment-based API-key support
-- Built-in public adapters for OpenAlex, Crossref, Semantic Scholar, Stack Overflow, Open Library, Internet Archive, GitHub repositories, and Hacker News
+- Built-in public adapters for OpenAlex, Crossref, Semantic Scholar, Stack Overflow, Open Library, Internet Archive, GitHub repositories, Hacker News, GitLab, npm, Google Books, and TVMaze
 - Unit tests and AGPL-3.0-or-later licensing
 
 ## Planned gates

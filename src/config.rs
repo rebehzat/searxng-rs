@@ -192,6 +192,55 @@ impl Config {
                     ("snippet_field", "story_text"),
                 ],
             ),
+            (
+                "gitlab_projects",
+                "json_api",
+                vec![
+                    ("endpoint", "https://gitlab.com/api/v4/projects"),
+                    ("query_param", "search"),
+                    ("limit_param", "per_page"),
+                    ("title_field", "name_with_namespace"),
+                    ("url_field", "web_url"),
+                    ("snippet_field", "description"),
+                ],
+            ),
+            (
+                "npm_packages",
+                "json_api",
+                vec![
+                    ("endpoint", "https://registry.npmjs.org/-/v1/search"),
+                    ("query_param", "text"),
+                    ("limit_param", "size"),
+                    ("results_path", "objects"),
+                    ("title_field", "package.name"),
+                    ("url_field", "package.links.npm"),
+                    ("snippet_field", "package.description"),
+                ],
+            ),
+            (
+                "google_books",
+                "json_api",
+                vec![
+                    ("endpoint", "https://www.googleapis.com/books/v1/volumes"),
+                    ("query_param", "q"),
+                    ("limit_param", "maxResults"),
+                    ("results_path", "items"),
+                    ("title_field", "volumeInfo.title"),
+                    ("url_field", "volumeInfo.infoLink"),
+                    ("snippet_field", "volumeInfo.description"),
+                ],
+            ),
+            (
+                "tvmaze",
+                "json_api",
+                vec![
+                    ("endpoint", "https://api.tvmaze.com/search/shows"),
+                    ("query_param", "q"),
+                    ("title_field", "show.name"),
+                    ("url_field", "show.url"),
+                    ("snippet_field", "show.summary"),
+                ],
+            ),
         ];
         let engines = definitions
             .into_iter()

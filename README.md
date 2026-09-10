@@ -32,7 +32,7 @@ searxng-rs engines
 searxng-rs schema
 ```
 
-Built-in providers currently include DuckDuckGo, Wikipedia, OpenAlex, Crossref, Semantic Scholar, Stack Overflow, Open Library, Internet Archive, GitHub repositories, and Hacker News. Results from an unavailable engine are reported in `engines[].error`; one backend failure does not discard successful results from other backends.
+Built-in providers currently include DuckDuckGo, Wikipedia, OpenAlex, Crossref, Semantic Scholar, Stack Overflow, Open Library, Internet Archive, GitHub repositories, Hacker News, GitLab, npm, Google Books, and TVMaze. Results from an unavailable engine are reported in `engines[].error`; one backend failure does not discard successful results from other backends.
 
 ## Agent protocol (JSONL)
 
