@@ -8,6 +8,7 @@ mod config;
 mod engines;
 mod error;
 mod models;
+mod serve;
 
 use std::collections::HashSet;
 use std::io::{self, BufRead, Write};
@@ -49,6 +50,15 @@ enum Command {
     Engines,
     /// Print a tool schema for OpenClaw/pi-style adapters.
     Schema,
+    /// Serve a SearXNG-compatible JSON search API.
+    Serve {
+        /// Address to bind.
+        #[arg(long, default_value = "127.0.0.1")]
+        bind: String,
+        /// Port to listen on.
+        #[arg(long, default_value_t = 8888)]
+        port: u16,
+    },
 }
 
 #[derive(Debug, Parser)]
@@ -121,6 +131,9 @@ async fn main() -> Result<()> {
                 })
                 .collect();
             println!("{}", serde_json::to_string_pretty(&infos)?);
+        }
+        Some(Command::Serve { bind, port }) => {
+            return serve::run(config, bind, port).await;
         }
         Some(Command::Schema) => {
             println!(
