@@ -302,8 +302,7 @@ mod tests {
         let engine = engine();
         let base = engine.build_url("rust");
         let tracking = "https://www.bing.com/ck/a?u=a1%%%not-base64%%%";
-        let html =
-            format!(r#"<li class="b_algo"><h2><a href="{tracking}">Rust</a></h2></li>"#);
+        let html = format!(r#"<li class="b_algo"><h2><a href="{tracking}">Rust</a></h2></li>"#);
 
         let results = engine.parse_html(&base, &html);
         assert_eq!(results.len(), 1);
@@ -318,10 +317,8 @@ mod tests {
 
     #[test]
     fn ignores_non_bing_redirect_urls() {
-        let url = Url::parse(
-            "https://example.com/ck/a?u=a1aHR0cHM6Ly93d3cucnVzdC1sYW5nLm9yZy8",
-        )
-        .unwrap();
+        let url =
+            Url::parse("https://example.com/ck/a?u=a1aHR0cHM6Ly93d3cucnVzdC1sYW5nLm9yZy8").unwrap();
         assert!(decode_bing_redirect(&url).is_none());
     }
 }
