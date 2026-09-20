@@ -73,7 +73,7 @@ fn decode_bing_redirect(url: &Url) -> Option<Url> {
 
     let encoded = url.query_pairs().find(|(key, _)| key == "u")?.1;
     let encoded = encoded.strip_prefix("a1")?;
-    let decoded = decode_base64url(encoded.as_ref())?;
+    let decoded = decode_base64url(encoded)?;
     let target = Url::parse(std::str::from_utf8(&decoded).ok()?).ok()?;
 
     matches!(target.scheme(), "http" | "https").then_some(target)
