@@ -39,6 +39,46 @@ fn normalize_ws(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+fn decode_base64url(input: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(input.len() * 3 / 4);
+    let mut buffer = 0u32;
+    let mut bits = 0u8;
+
+    for byte in input.bytes() {
+        let value = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'-' => 62,
+            b'_' => 63,
+            b'=' => break,
+            _ => return None,
+        };
+        buffer = (buffer << 6) | u32::from(value);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buffer >> bits) as u8);
+            buffer &= (1 << bits) - 1;
+        }
+    }
+
+    Some(out)
+}
+
+fn decode_bing_redirect(url: &Url) -> Option<Url> {
+    if url.host_str()? != "www.bing.com" || url.path() != "/ck/a" {
+        return None;
+    }
+
+    let encoded = url.query_pairs().find(|(key, _)| key == "u")?.1;
+    let encoded = encoded.strip_prefix("a1")?;
+    let decoded = decode_base64url(encoded)?;
+    let target = Url::parse(std::str::from_utf8(&decoded).ok()?).ok()?;
+
+    matches!(target.scheme(), "http" | "https").then_some(target)
+}
+
 impl HtmlScrape {
     pub fn from_config(name: &str, cfg: &EngineConfig, user_agent: &str) -> anyhow::Result<Self> {
         let endpoint = cfg.string_param("endpoint", "");
@@ -121,7 +161,13 @@ impl HtmlScrape {
                 continue;
             }
             let url = match base.join(raw_href) {
-                Ok(u) if u.as_str().starts_with("http") => u.to_string(),
+                Ok(u) if matches!(u.scheme(), "http" | "https") => {
+                    if self.name == "bing" {
+                        decode_bing_redirect(&u).unwrap_or(u).to_string()
+                    } else {
+                        u.to_string()
+                    }
+                }
                 _ => continue,
             };
             let snippet = self
@@ -234,5 +280,45 @@ mod tests {
         // Relative hrefs resolve against the search endpoint.
         assert_eq!(results[1].1, "https://www.bing.com/relative/path");
         assert_eq!(results[1].2, None);
+    }
+
+    #[test]
+    fn decodes_bing_tracking_url() {
+        let engine = engine();
+        let base = engine.build_url("rust");
+        let html = r#"
+        <li class="b_algo">
+          <h2><a href="https://www.bing.com/ck/a?u=a1aHR0cHM6Ly93d3cucnVzdC1sYW5nLm9yZy8">Rust</a></h2>
+        </li>
+        "#;
+
+        let results = engine.parse_html(&base, html);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].1, "https://www.rust-lang.org/");
+    }
+
+    #[test]
+    fn leaves_malformed_bing_tracking_url_unchanged() {
+        let engine = engine();
+        let base = engine.build_url("rust");
+        let tracking = "https://www.bing.com/ck/a?u=a1%%%not-base64%%%";
+        let html = format!(r#"<li class="b_algo"><h2><a href="{tracking}">Rust</a></h2></li>"#);
+
+        let results = engine.parse_html(&base, &html);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].1, tracking);
+    }
+
+    #[test]
+    fn rejects_non_http_bing_redirect_target() {
+        let url = Url::parse("https://www.bing.com/ck/a?u=a1amF2YXNjcmlwdDphbGVydCgxKQ").unwrap();
+        assert!(decode_bing_redirect(&url).is_none());
+    }
+
+    #[test]
+    fn ignores_non_bing_redirect_urls() {
+        let url =
+            Url::parse("https://example.com/ck/a?u=a1aHR0cHM6Ly93d3cucnVzdC1sYW5nLm9yZy8").unwrap();
+        assert!(decode_bing_redirect(&url).is_none());
     }
 }
