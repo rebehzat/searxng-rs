@@ -46,12 +46,12 @@ pub fn build_engine(
             name,
             user_agent,
             &cfg.string_param("region", "wt-wt"),
-        ))),
+        )?)),
         "wikipedia" | "wikipedia_rest" => Ok(Box::new(wikipedia::WikipediaRest::new(
             name,
             user_agent,
             &cfg.string_param("language", "en"),
-        ))),
+        )?)),
         "html_scrape" => Ok(Box::new(html_scrape::HtmlScrape::from_config(
             name, cfg, user_agent,
         )?)),

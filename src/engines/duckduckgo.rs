@@ -27,16 +27,15 @@ pub struct DuckDuckGoHtml {
 }
 
 impl DuckDuckGoHtml {
-    pub fn new(name: &str, user_agent: &str, region: &str) -> Self {
+    pub fn new(name: &str, user_agent: &str, region: &str) -> anyhow::Result<Self> {
         let client = reqwest::Client::builder()
             .user_agent(user_agent.to_string())
-            .build()
-            .expect("static client configuration");
-        Self {
+            .build()?;
+        Ok(Self {
             name: name.to_string(),
             client,
             region: region.to_string(),
-        }
+        })
     }
 
     /// Build the request URL for a query.
@@ -195,8 +194,16 @@ mod tests {
 "#;
 
     #[test]
+    fn invalid_user_agent_is_rejected_without_panicking() {
+        let error = DuckDuckGoHtml::new("ddg_html", "bad\nuser-agent", "wt-wt")
+            .err()
+            .expect("invalid header should be rejected");
+        assert!(!error.to_string().is_empty());
+    }
+
+    #[test]
     fn build_url_encodes_query_and_region() {
-        let e = DuckDuckGoHtml::new("ddg_html", "ua/test", "wt-wt");
+        let e = DuckDuckGoHtml::new("ddg_html", "ua/test", "wt-wt").unwrap();
         let url = e.build_url("rust & \"lang\"");
         let s = url.as_str();
         assert!(s.starts_with(super::ENDPOINT));
@@ -206,7 +213,7 @@ mod tests {
 
     #[test]
     fn parses_fixture_results() {
-        let e = DuckDuckGoHtml::new("ddg_html", "ua/test", "wt-wt");
+        let e = DuckDuckGoHtml::new("ddg_html", "ua/test", "wt-wt").unwrap();
         let results = e.parse_html(FIXTURE);
         assert_eq!(results.len(), 2, "empty-title block must be skipped");
 
@@ -231,7 +238,7 @@ mod tests {
 
     #[test]
     fn parse_of_junk_is_empty() {
-        let e = DuckDuckGoHtml::new("ddg_html", "ua/test", "wt-wt");
+        let e = DuckDuckGoHtml::new("ddg_html", "ua/test", "wt-wt").unwrap();
         assert!(e.parse_html("<html><body>blocked</body></html>").is_empty());
     }
 
