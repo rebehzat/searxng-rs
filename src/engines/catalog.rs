@@ -65,14 +65,11 @@ mod tests {
 
     #[test]
     fn safety_sensitive_catalog_entries_are_disabled_by_default() {
-        for name in [
-            "unsplash",
-            "deviantart",
-            "openverse",
-            "crates",
-            "huggingface",
-            "mwmbl",
-        ] {
+        // `unsplash` was removed from this list when it was enabled by default:
+        // its endpoint answers an honest plain HTTP 200 and its field paths match
+        // upstream. The remaining entries still ship opt-in, and each must keep a
+        // comment in its own catalog file saying why.
+        for name in ["deviantart", "openverse", "crates", "huggingface", "mwmbl"] {
             assert!(!entry(name).enabled, "{name} must be disabled by default");
         }
     }
