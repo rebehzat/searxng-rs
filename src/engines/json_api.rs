@@ -47,6 +47,13 @@ impl JsonApi {
         if endpoint.is_empty() {
             return Err(anyhow::anyhow!("engine '{name}' requires an endpoint"));
         }
+        let endpoint_url = Url::parse(&endpoint)
+            .map_err(|error| anyhow::anyhow!("engine '{name}': invalid endpoint: {error}"))?;
+        if !matches!(endpoint_url.scheme(), "http" | "https") {
+            return Err(anyhow::anyhow!(
+                "engine '{name}': endpoint must use http or https"
+            ));
+        }
         let api_key = match cfg.params.get("api_key_env") {
             Some(toml::Value::String(env_name)) if !env_name.is_empty() => std::env::var(env_name)
                 .ok()
@@ -74,18 +81,36 @@ impl JsonApi {
                 .then(|| cfg.string_param("fallback_url_field", "")),
             fallback_url_template: (!cfg.string_param("fallback_url_template", "").is_empty())
                 .then(|| cfg.string_param("fallback_url_template", "")),
-            max_limit: cfg.string_param("max_limit", "").parse::<usize>().ok(),
+            max_limit: cfg.usize_param("max_limit", None),
             snippet_field: cfg.string_param("snippet_field", "snippet"),
             array_value_field: (!cfg.string_param("array_value_field", "").is_empty())
                 .then(|| cfg.string_param("array_value_field", "")),
-            normalize_title_html: cfg.string_param("normalize_title_html", "") == "true",
-            normalize_snippet_html: cfg.string_param("normalize_snippet_html", "") == "true",
-            snippet_max_length: cfg
-                .string_param("snippet_max_length", "")
-                .parse::<usize>()
-                .ok(),
+            normalize_title_html: cfg.bool_param("normalize_title_html", false),
+            normalize_snippet_html: cfg.bool_param("normalize_snippet_html", false),
+            snippet_max_length: cfg.usize_param("snippet_max_length", None),
             api_key,
         })
+    }
+
+    fn has_result_array(&self, value: &Value) -> bool {
+        if value.get("error").is_some_and(is_provider_error) {
+            return false;
+        }
+        self.results_path
+            .as_deref()
+            .and_then(|path| value_at(value, path))
+            .or_else(|| value.get("results"))
+            .or_else(|| value.get("items"))
+            .or(Some(value))
+            .and_then(Value::as_array)
+            .is_some()
+    }
+
+    fn parse_value_checked(&self, value: Value, limit: usize) -> EngineResult<Vec<SearchResult>> {
+        if !self.has_result_array(&value) {
+            return Err(EngineError::Parse);
+        }
+        Ok(self.parse_value(value, limit))
     }
 
     fn parse_value(&self, value: Value, limit: usize) -> Vec<SearchResult> {
@@ -107,7 +132,7 @@ impl JsonApi {
                 if self.normalize_title_html {
                     title = html_to_text(&title);
                 }
-                if title.is_empty() {
+                if title.trim().is_empty() {
                     return None;
                 }
 
@@ -128,7 +153,6 @@ impl JsonApi {
 
                 let snippet = self
                     .text_at(item, &self.snippet_field)
-                    .filter(|snippet| !snippet.is_empty())
                     .map(|snippet| {
                         let snippet = if self.normalize_snippet_html {
                             html_to_text(&snippet)
@@ -137,7 +161,7 @@ impl JsonApi {
                         };
                         truncate_text(snippet, self.snippet_max_length)
                     })
-                    .filter(|snippet| !snippet.is_empty());
+                    .filter(|snippet| !snippet.trim().is_empty());
                 Some(SearchResult::with_metadata(
                     self.name.clone(),
                     title,
@@ -164,8 +188,8 @@ impl JsonApi {
                         .or_else(|| scalar_text(value_at(item, array_value_field)?))
                 })
                 .collect::<String>();
-            let value = value.trim();
-            (!value.is_empty()).then(|| value.to_owned())
+            let value = normalize_ws(&value);
+            (!value.is_empty()).then_some(value)
         } else {
             // Preserve the original string-array behavior when object-array
             // extraction was not requested.
@@ -209,8 +233,17 @@ impl JsonApi {
         if value.is_empty() {
             return None;
         }
-        let template = self.fallback_url_template.as_deref()?;
-        let fallback = template.replace("{value}", value).replace("{url}", value);
+        let fallback = if normalized_web_url(value).is_some() {
+            // Some providers (for example OpenAlex) return a DOI as an
+            // absolute URL, while others return the bare DOI. Avoid wrapping
+            // an already usable URL in a fallback template.
+            value.to_owned()
+        } else {
+            self.fallback_url_template.as_deref().map_or_else(
+                || value.to_owned(),
+                |template| template.replace("{value}", value).replace("{url}", value),
+            )
+        };
         self.build_result_url(item, &fallback, false)
     }
 
@@ -248,7 +281,18 @@ impl Engine for JsonApi {
         }
         let body = request.send().await?.error_for_status()?.text().await?;
         let value: Value = serde_json::from_str(&body).map_err(|_| EngineError::Parse)?;
-        Ok(self.parse_value(value, limit))
+        self.parse_value_checked(value, limit)
+    }
+}
+
+fn is_provider_error(value: &Value) -> bool {
+    match value {
+        Value::Null | Value::Bool(false) => false,
+        // Numeric zero is a conventional success code in otherwise
+        // error-shaped response envelopes.
+        Value::Number(number) => number.as_f64() != Some(0.0),
+        Value::String(error) => !error.trim().is_empty(),
+        _ => true,
     }
 }
 
@@ -268,6 +312,10 @@ fn scalar_text(value: &Value) -> Option<String> {
         .as_str()
         .map(str::to_owned)
         .or_else(|| value.as_number().map(ToString::to_string))
+}
+
+fn normalize_ws(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn html_to_text(input: &str) -> String {
@@ -547,6 +595,52 @@ mod tests {
     }
 
     #[test]
+    fn absolute_fallback_url_bypasses_a_bare_identifier_template() {
+        let config = crate::config::Config::builtin_defaults();
+        let e = JsonApi::from_config("openalex", &config.engines["openalex"], "test/1").unwrap();
+        let results = e.parse_value(
+            serde_json::json!({"results":[
+                {
+                    "title":"Absolute DOI",
+                    "url":null,
+                    "doi":"https://doi.org/10.1234/absolute"
+                },
+                {
+                    "title":"Bare DOI",
+                    "url":null,
+                    "doi":"10.1234/bare"
+                }
+            ]}),
+            2,
+        );
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].url, "https://doi.org/10.1234/absolute");
+        assert_eq!(results[1].url, "https://doi.org/10.1234/bare");
+    }
+
+    #[test]
+    fn fallback_url_field_can_stand_alone_and_still_rejects_non_web_urls() {
+        let e = JsonApi::from_config(
+            "api",
+            &config(&[
+                ("endpoint", "https://example.test"),
+                ("fallback_url_field", "fallback"),
+            ]),
+            "test/1",
+        )
+        .unwrap();
+        let results = e.parse_value(
+            serde_json::json!({"results":[
+                {"title":"Web fallback", "url":null, "fallback":"https://example.test/fallback"},
+                {"title":"Unsafe fallback", "url":null, "fallback":"javascript:alert(1)"}
+            ]}),
+            2,
+        );
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].url, "https://example.test/fallback");
+    }
+
+    #[test]
     fn uses_fallback_url_when_primary_url_is_invalid() {
         let e = JsonApi::from_config(
             "api",
@@ -632,6 +726,60 @@ mod tests {
             1,
         );
         assert_eq!(results[0].title, "Rust");
+    }
+
+    #[test]
+    fn normalizes_whitespace_in_configured_object_array_fragments() {
+        let e = JsonApi::from_config(
+            "api",
+            &config(&[
+                ("endpoint", "https://example.test"),
+                ("array_value_field", "value"),
+                ("snippet_field", "extract"),
+            ]),
+            "test/1",
+        )
+        .unwrap();
+        let results = e.parse_value(
+            serde_json::json!({"results":[{
+                "title":[{"value":" Rust\n documentation "}],
+                "url":"https://example.test/rust",
+                "extract":[{"value":"A fast\nlanguage"}]
+            }]}),
+            1,
+        );
+        assert_eq!(results[0].title, "Rust documentation");
+        assert_eq!(results[0].snippet.as_deref(), Some("A fast language"));
+    }
+
+    #[test]
+    fn configured_object_array_extraction_skips_malformed_fragments() {
+        let e = JsonApi::from_config(
+            "api",
+            &config(&[
+                ("endpoint", "https://example.test"),
+                ("array_value_field", "value"),
+                ("snippet_field", "extract"),
+            ]),
+            "test/1",
+        )
+        .unwrap();
+        let results = e.parse_value(
+            serde_json::json!({"results":[{
+                "title":[
+                    null,
+                    {"other":"ignored"},
+                    {"value":{"value":"ignored"}},
+                    {"value":" Rust\n"},
+                    " documentation "
+                ],
+                "url":"https://example.test/rust",
+                "extract":[{"value":null},{"value":"Safe "},{"value":"text"}]
+            }]}),
+            1,
+        );
+        assert_eq!(results[0].title, "Rust documentation");
+        assert_eq!(results[0].snippet.as_deref(), Some("Safe text"));
     }
 
     #[test]
@@ -773,5 +921,178 @@ mod tests {
     #[test]
     fn missing_endpoint_is_rejected() {
         assert!(JsonApi::from_config("api", &config(&[]), "test/1").is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_and_non_http_endpoints() {
+        for (endpoint, expected) in [
+            ("not a URL", "invalid endpoint"),
+            ("file:///etc/passwd", "must use http or https"),
+            ("https://", "invalid endpoint"),
+        ] {
+            let error =
+                match JsonApi::from_config("api", &config(&[("endpoint", endpoint)]), "test/1") {
+                    Ok(_) => panic!("invalid endpoint should be rejected"),
+                    Err(error) => error.to_string(),
+                };
+            assert!(error.contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn accepts_native_toml_boolean_and_integer_options() {
+        let config = crate::config::Config::from_toml_str(
+            r#"
+[engines.api]
+type = "json_api"
+endpoint = "https://example.test"
+normalize_snippet_html = true
+snippet_max_length = 5
+max_limit = 40
+"#,
+        )
+        .unwrap();
+        let e = JsonApi::from_config("api", &config.engines["api"], "test/1").unwrap();
+        assert!(e.normalize_snippet_html);
+        assert_eq!(e.snippet_max_length, Some(5));
+        assert_eq!(e.max_limit, Some(40));
+    }
+
+    #[test]
+    fn rejects_blank_titles_and_snippets() {
+        let e = JsonApi::from_config(
+            "api",
+            &config(&[("endpoint", "https://example.test")]),
+            "test/1",
+        )
+        .unwrap();
+        let results = e.parse_value(
+            serde_json::json!({"results":[
+                {"title":" \n\t", "url":"https://example.test/blank-title"},
+                {"title":"Valid", "url":"https://example.test/valid", "snippet":"  \n"},
+                {"title":"Also valid", "url":"https://example.test/valid-2", "snippet":"text"}
+            ]}),
+            3,
+        );
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].title, "Valid");
+        assert_eq!(results[0].snippet, None);
+        assert_eq!(results[1].snippet.as_deref(), Some("text"));
+    }
+
+    #[test]
+    fn rejects_error_shaped_payloads_but_accepts_empty_result_arrays() {
+        let e = JsonApi::from_config(
+            "api",
+            &config(&[("endpoint", "https://example.test")]),
+            "test/1",
+        )
+        .unwrap();
+        for value in [
+            serde_json::json!({"error":"rate limited"}),
+            serde_json::json!({"error":"rate limited", "results":[]}),
+            serde_json::json!({}),
+            serde_json::Value::Null,
+        ] {
+            assert!(e.parse_value_checked(value, 5).is_err());
+        }
+        assert!(
+            e.parse_value_checked(serde_json::json!({"results":[]}), 5)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn accepts_falsy_error_indicators_on_otherwise_valid_payloads() {
+        let e = JsonApi::from_config(
+            "api",
+            &config(&[("endpoint", "https://example.test")]),
+            "test/1",
+        )
+        .unwrap();
+        for error in [
+            serde_json::Value::Null,
+            serde_json::Value::Bool(false),
+            serde_json::json!(0),
+            serde_json::json!(0.0),
+            serde_json::json!(""),
+            serde_json::json!(" \n\t"),
+        ] {
+            let value = serde_json::json!({
+                "error": error,
+                "results": [{
+                    "title": "Valid",
+                    "url": "https://example.test/result"
+                }]
+            });
+            let results = e
+                .parse_value_checked(value, 5)
+                .expect("empty error indicator should not fail a valid response");
+            assert_eq!(results[0].title, "Valid");
+        }
+    }
+
+    #[test]
+    fn validates_the_selected_result_array_shape() {
+        let e = JsonApi::from_config(
+            "api",
+            &config(&[
+                ("endpoint", "https://example.test"),
+                ("results_path", "message.items"),
+            ]),
+            "test/1",
+        )
+        .unwrap();
+        let result = serde_json::json!({
+            "title": "Valid",
+            "url": "https://example.test/result"
+        });
+        assert!(
+            e.parse_value_checked(
+                serde_json::json!({
+                    "message": {"items": {"unexpected": result.clone()}},
+                    "results": [result.clone()]
+                }),
+                5,
+            )
+            .is_err()
+        );
+        assert!(
+            e.parse_value_checked(serde_json::json!({"message": {"items": []}}), 5)
+                .is_ok()
+        );
+        // Keep the legacy conventional-array fallback when a configured path
+        // is absent from an otherwise compatible response.
+        assert!(
+            e.parse_value_checked(serde_json::json!({"results": [result]}), 5)
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn search_reports_provider_error_payloads_as_parse_errors() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/search", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            let read = stream.read(&mut request).await.unwrap();
+            assert!(read > 0);
+            let body = r#"{"error":"rate limited"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        let e = JsonApi::from_config("api", &config(&[("endpoint", &endpoint)]), "test/1").unwrap();
+        assert!(matches!(
+            e.search("rust", 5, std::time::Duration::from_secs(1)).await,
+            Err(EngineError::Parse)
+        ));
+        server.await.unwrap();
     }
 }

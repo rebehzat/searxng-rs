@@ -33,6 +33,24 @@ impl EngineConfig {
             _ => default.to_string(),
         }
     }
+
+    /// Read a boolean parameter from either native TOML or a string value.
+    pub fn bool_param(&self, key: &str, default: bool) -> bool {
+        match self.params.get(key) {
+            Some(toml::Value::Boolean(value)) => *value,
+            Some(toml::Value::String(value)) => value.trim().eq_ignore_ascii_case("true"),
+            _ => default,
+        }
+    }
+
+    /// Read a non-negative integer parameter from either native TOML or a string value.
+    pub fn usize_param(&self, key: &str, default: Option<usize>) -> Option<usize> {
+        match self.params.get(key) {
+            Some(toml::Value::Integer(value)) => usize::try_from(*value).ok(),
+            Some(toml::Value::String(value)) => value.trim().parse().ok(),
+            _ => default,
+        }
+    }
 }
 
 fn default_true() -> bool {
@@ -485,27 +503,69 @@ enabled = false
     }
 
     #[test]
+    fn parses_native_and_legacy_scalar_engine_options() {
+        let config = Config::from_toml_str(
+            r#"
+[engines.native]
+type = "json_api"
+endpoint = "https://example.test"
+normalize_title_html = true
+snippet_max_length = 5
+max_limit = 40
+
+[engines.invalid]
+type = "json_api"
+endpoint = "https://example.test"
+normalize_title_html = "not-a-boolean"
+snippet_max_length = -1
+max_limit = 1.5
+"#,
+        )
+        .unwrap();
+        let native = &config.engines["native"];
+        assert!(native.bool_param("normalize_title_html", false));
+        assert_eq!(native.usize_param("snippet_max_length", None), Some(5));
+        assert_eq!(native.usize_param("max_limit", None), Some(40));
+
+        let invalid = &config.engines["invalid"];
+        assert!(!invalid.bool_param("normalize_title_html", true));
+        assert_eq!(invalid.usize_param("snippet_max_length", None), None);
+        assert_eq!(invalid.usize_param("max_limit", None), None);
+        assert_eq!(invalid.usize_param("missing", Some(9)), Some(9));
+
+        let legacy = EngineConfig {
+            engine_type: "json_api".into(),
+            enabled: true,
+            params: [
+                (
+                    "normalize_snippet_html".to_string(),
+                    toml::Value::from(" TrUe "),
+                ),
+                ("snippet_max_length".to_string(), toml::Value::from(" 7 ")),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        assert!(legacy.bool_param("normalize_snippet_html", false));
+        assert_eq!(legacy.usize_param("snippet_max_length", None), Some(7));
+    }
+
+    #[test]
     fn disabled_catalog_entries_stay_disabled_during_selection() {
         let cfg = Config::builtin_defaults();
-        let disabled = [
-            "unsplash",
-            "deviantart",
-            "openverse",
-            "crates",
-            "huggingface",
-            "mwmbl",
-        ];
-        for name in disabled {
+        let disabled = crate::engines::catalog::definitions()
+            .into_iter()
+            .filter(|entry| !entry.enabled)
+            .map(|entry| entry.name.to_string())
+            .collect::<Vec<_>>();
+        assert!(!disabled.is_empty());
+        for name in &disabled {
             assert!(!cfg.engines[name].enabled, "{name} should be disabled");
         }
 
-        let requested = disabled
-            .iter()
-            .map(|name| (*name).to_string())
-            .collect::<Vec<_>>();
-        let (selected, unknown) = cfg.select_engines(Some(&requested));
+        let (selected, unknown) = cfg.select_engines(Some(&disabled));
         assert!(selected.is_empty());
-        assert_eq!(unknown, requested);
+        assert_eq!(unknown, disabled);
 
         let (selected, _) = cfg.select_engines(None);
         assert!(

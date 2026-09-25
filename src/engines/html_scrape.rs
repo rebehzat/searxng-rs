@@ -42,18 +42,30 @@ fn normalize_ws(text: &str) -> String {
 }
 
 fn decode_base64url(input: &str) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(input.len() * 3 / 4);
+    let bytes = input.as_bytes();
+    let padding = bytes.iter().rev().take_while(|&&byte| byte == b'=').count();
+    if padding > 2 || bytes[..bytes.len() - padding].contains(&b'=') {
+        return None;
+    }
+    let data = &bytes[..bytes.len() - padding];
+    if padding > 0 {
+        if data.len() % 4 == 1 || padding != (4 - data.len() % 4) % 4 {
+            return None;
+        }
+    } else if data.len() % 4 == 1 {
+        return None;
+    }
+
+    let mut out = Vec::with_capacity(data.len() * 3 / 4);
     let mut buffer = 0u32;
     let mut bits = 0u8;
-
-    for byte in input.bytes() {
+    for byte in data {
         let value = match byte {
             b'A'..=b'Z' => byte - b'A',
             b'a'..=b'z' => byte - b'a' + 26,
             b'0'..=b'9' => byte - b'0' + 52,
             b'-' => 62,
             b'_' => 63,
-            b'=' => break,
             _ => return None,
         };
         buffer = (buffer << 6) | u32::from(value);
@@ -61,10 +73,12 @@ fn decode_base64url(input: &str) -> Option<Vec<u8>> {
         if bits >= 8 {
             bits -= 8;
             out.push((buffer >> bits) as u8);
-            buffer &= (1 << bits) - 1;
+            buffer &= (1u32 << bits) - 1;
         }
     }
-
+    if bits > 0 && buffer != 0 {
+        return None;
+    }
     Some(out)
 }
 
@@ -179,10 +193,15 @@ impl HtmlScrape {
                 .and_then(|attribute| {
                     title_element
                         .and_then(|title| title.value().attr(attribute))
-                        .or_else(|| link.value().attr(attribute))
+                        .map(normalize_ws)
+                        .filter(|title| !title.is_empty())
+                        .or_else(|| {
+                            link.value()
+                                .attr(attribute)
+                                .map(normalize_ws)
+                                .filter(|title| !title.is_empty())
+                        })
                 })
-                .map(normalize_ws)
-                .filter(|title| !title.is_empty())
                 .or_else(|| {
                     title_element.map(|title| normalize_ws(&title.text().collect::<String>()))
                 })
@@ -192,6 +211,7 @@ impl HtmlScrape {
                 continue;
             }
             let raw_href = link.value().attr(&self.link_url_attr).unwrap_or_default();
+            let raw_href = raw_href.trim();
             if raw_href.is_empty() {
                 continue;
             }
@@ -395,6 +415,73 @@ mod tests {
     }
 
     #[test]
+    fn title_attribute_falls_back_when_selected_title_attribute_is_blank() {
+        let mut params = std::collections::BTreeMap::new();
+        for (key, value) in [
+            ("endpoint", "https://example.test/search"),
+            ("result_selector", ".result"),
+            ("link_selector", "a"),
+            ("title_selector", ".title"),
+            ("title_attr", "aria-label"),
+        ] {
+            params.insert(key.to_string(), toml::Value::from(value));
+        }
+        let engine = HtmlScrape::from_config(
+            "custom",
+            &EngineConfig {
+                engine_type: "html_scrape".into(),
+                enabled: true,
+                params,
+            },
+            "test/1",
+        )
+        .unwrap();
+        let html = r#"
+            <div class="result">
+                <span class="title" aria-label="  ">ignored</span>
+                <a href="/result" aria-label="Useful title">link text</a>
+            </div>
+            <div class="result">
+                <span class="title">
+                </span>
+                <a href="/blank-title-text">Fallback link text</a>
+            </div>
+            <div class="result">
+                <a href="/no-title-element" aria-label="Link attribute">link text</a>
+            </div>
+        "#;
+        let results = engine.parse_html(&engine.build_url("rust"), html);
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| result.0.as_str())
+                .collect::<Vec<_>>(),
+            ["Useful title", "Fallback link text", "Link attribute"]
+        );
+    }
+
+    #[test]
+    fn trims_whitespace_around_result_hrefs() {
+        let engine = engine();
+        let base = engine.build_url("rust");
+        let html = r#"<li class="b_algo"><h2><a href="  /trimmed  ">Trimmed</a></h2></li>"#;
+        let results = engine.parse_html(&base, html);
+        assert_eq!(results[0].1, "https://www.bing.com/trimmed");
+    }
+
+    #[test]
+    fn rejects_non_web_result_hrefs() {
+        let engine = engine();
+        let base = engine.build_url("rust");
+        let html = r#"
+            <li class="b_algo"><h2><a href="javascript:alert(1)">JavaScript</a></h2></li>
+            <li class="b_algo"><h2><a href="data:text/html,unsafe">Data</a></h2></li>
+            <li class="b_algo"><h2><a href="file:///etc/passwd">File</a></h2></li>
+        "#;
+        assert!(engine.parse_html(&base, html).is_empty());
+    }
+
+    #[test]
     fn builds_url_with_extra_params() {
         let engine = engine();
         let url = engine.build_url("rust async");
@@ -459,5 +546,23 @@ mod tests {
         let url =
             Url::parse("https://example.com/ck/a?u=a1aHR0cHM6Ly93d3cucnVzdC1sYW5nLm9yZy8").unwrap();
         assert!(decode_bing_redirect(&url).is_none());
+    }
+
+    #[test]
+    fn rejects_noncanonical_base64url_data() {
+        for input in [
+            "YQ==junk", // data after padding
+            "Y=Q=",     // padding in the middle
+            "YWJj=",    // impossible padding length
+            "YQ=",      // impossible padding count
+            "YR",       // nonzero unused trailing bits
+            "YQ==j",    // invalid trailing character
+            "YQ==/",    // standard-base64 alphabet
+        ] {
+            assert!(decode_base64url(input).is_none(), "accepted {input}");
+        }
+        assert!(decode_base64url("YQ==").is_some());
+        assert!(decode_base64url("YQ").is_some());
+        assert_eq!(decode_base64url("YWJj"), Some(b"abc".to_vec()));
     }
 }
