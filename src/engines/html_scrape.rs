@@ -30,6 +30,7 @@ pub struct HtmlScrape {
     extra_params: Vec<(String, String)>,
     result_selector: Selector,
     link_selector: Selector,
+    title_selector: Option<Selector>,
     snippet_selector: Option<Selector>,
     link_url_attr: String,
 }
@@ -98,6 +99,7 @@ impl HtmlScrape {
         if link_selector.is_empty() {
             anyhow::bail!("engine '{name}' requires a link_selector");
         }
+        let title_selector = cfg.string_param("title_selector", "");
         let snippet_selector = cfg.string_param("snippet_selector", "");
         let extra_params = {
             let mut params: Vec<(String, String)> = cfg
@@ -122,6 +124,13 @@ impl HtmlScrape {
                 .map_err(|e| anyhow::anyhow!("engine '{name}': invalid result_selector: {e:?}"))?,
             link_selector: Selector::parse(&link_selector)
                 .map_err(|e| anyhow::anyhow!("engine '{name}': invalid link_selector: {e:?}"))?,
+            title_selector: (!title_selector.is_empty())
+                .then(|| {
+                    Selector::parse(&title_selector).map_err(|e| {
+                        anyhow::anyhow!("engine '{name}': invalid title_selector: {e:?}")
+                    })
+                })
+                .transpose()?,
             snippet_selector: (!snippet_selector.is_empty())
                 .then(|| {
                     Selector::parse(&snippet_selector).map_err(|e| {
@@ -157,7 +166,13 @@ impl HtmlScrape {
             let Some(link) = element.select(&self.link_selector).next() else {
                 continue;
             };
-            let title = normalize_ws(&link.text().collect::<String>());
+            let title = self
+                .title_selector
+                .as_ref()
+                .and_then(|selector| element.select(selector).next())
+                .map(|title| normalize_ws(&title.text().collect::<String>()))
+                .filter(|title| !title.is_empty())
+                .unwrap_or_else(|| normalize_ws(&link.text().collect::<String>()));
             if title.is_empty() {
                 continue;
             }
@@ -307,6 +322,33 @@ mod tests {
         .expect("non-HTTP endpoint should be rejected")
         .to_string();
         assert!(error.contains("must use http or https"));
+    }
+
+    #[test]
+    fn uses_title_selector_when_configured() {
+        let mut params = std::collections::BTreeMap::new();
+        for (key, value) in [
+            ("endpoint", "https://www.bing.com/search"),
+            ("query_param", "q"),
+            ("result_selector", "li.b_algo"),
+            ("link_selector", "h2 a"),
+            ("title_selector", ".title"),
+        ] {
+            params.insert(key.to_string(), toml::Value::from(value));
+        }
+        let cfg = HtmlScrape::from_config(
+            "bing",
+            &EngineConfig {
+                engine_type: "html_scrape".into(),
+                enabled: true,
+                params,
+            },
+            "searxng-rs/test",
+        )
+        .unwrap();
+        let html = r#"<li class="b_algo"><h2><a href="https://example.test"><span class="title">Primary title</span> Extra text</a></h2></li>"#;
+        let results = cfg.parse_html(&cfg.build_url("rust"), html);
+        assert_eq!(results[0].0, "Primary title");
     }
 
     #[test]
