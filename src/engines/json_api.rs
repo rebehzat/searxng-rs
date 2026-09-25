@@ -31,6 +31,7 @@ pub struct JsonApi {
     url_source_field: Option<String>,
     fallback_url_field: Option<String>,
     fallback_url_template: Option<String>,
+    max_limit: Option<usize>,
     snippet_field: String,
     api_key: Option<(String, String)>,
 }
@@ -68,6 +69,7 @@ impl JsonApi {
                 .then(|| cfg.string_param("fallback_url_field", "")),
             fallback_url_template: (!cfg.string_param("fallback_url_template", "").is_empty())
                 .then(|| cfg.string_param("fallback_url_template", "")),
+            max_limit: cfg.string_param("max_limit", "").parse::<usize>().ok(),
             snippet_field: cfg.string_param("snippet_field", "snippet"),
             api_key,
         })
@@ -149,6 +151,7 @@ impl Engine for JsonApi {
         timeout: Duration,
     ) -> EngineResult<Vec<SearchResult>> {
         let mut params = vec![(self.query_param.clone(), query.to_owned())];
+        let limit = self.max_limit.map_or(limit, |max| limit.min(max));
         if let Some(limit_param) = &self.limit_param {
             params.push((limit_param.clone(), limit.to_string()));
         }
@@ -315,6 +318,17 @@ mod tests {
             1,
         );
         assert_eq!(results[0].url, "https://news.ycombinator.com/item?id=42");
+    }
+
+    #[test]
+    fn provider_max_limit_is_applied() {
+        let e = JsonApi::from_config(
+            "api",
+            &config(&[("endpoint", "https://example.test"), ("max_limit", "40")]),
+            "test/1",
+        )
+        .unwrap();
+        assert_eq!(e.max_limit, Some(40));
     }
 
     #[test]
