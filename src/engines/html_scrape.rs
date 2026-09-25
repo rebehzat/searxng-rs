@@ -85,6 +85,11 @@ impl HtmlScrape {
         if endpoint.is_empty() {
             anyhow::bail!("engine '{name}' requires an endpoint");
         }
+        let endpoint_url = Url::parse(&endpoint)
+            .map_err(|error| anyhow::anyhow!("engine '{name}': invalid endpoint: {error}"))?;
+        if !matches!(endpoint_url.scheme(), "http" | "https") {
+            anyhow::bail!("engine '{name}': endpoint must use http or https");
+        }
         let result_selector = cfg.string_param("result_selector", "");
         if result_selector.is_empty() {
             anyhow::bail!("engine '{name}' requires a result_selector");
@@ -254,6 +259,55 @@ mod tests {
       <li class="b_algo"><h2><a>No href here</a></h2></li>
     </body></html>
     "#;
+
+    #[test]
+    fn rejects_invalid_endpoint_without_panicking() {
+        let error = HtmlScrape::from_config(
+            "broken",
+            &EngineConfig {
+                engine_type: "html_scrape".into(),
+                enabled: true,
+                params: [
+                    ("endpoint".to_string(), toml::Value::from("not a URL")),
+                    ("result_selector".to_string(), toml::Value::from(".result")),
+                    ("link_selector".to_string(), toml::Value::from("a")),
+                ]
+                .into_iter()
+                .collect(),
+            },
+            "test/1",
+        )
+        .err()
+        .expect("invalid endpoint should be rejected")
+        .to_string();
+        assert!(error.contains("invalid endpoint"));
+    }
+
+    #[test]
+    fn rejects_non_http_endpoint() {
+        let error = HtmlScrape::from_config(
+            "broken",
+            &EngineConfig {
+                engine_type: "html_scrape".into(),
+                enabled: true,
+                params: [
+                    (
+                        "endpoint".to_string(),
+                        toml::Value::from("file:///etc/passwd"),
+                    ),
+                    ("result_selector".to_string(), toml::Value::from(".result")),
+                    ("link_selector".to_string(), toml::Value::from("a")),
+                ]
+                .into_iter()
+                .collect(),
+            },
+            "test/1",
+        )
+        .err()
+        .expect("non-HTTP endpoint should be rejected")
+        .to_string();
+        assert!(error.contains("must use http or https"));
+    }
 
     #[test]
     fn builds_url_with_extra_params() {
