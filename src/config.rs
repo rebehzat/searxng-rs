@@ -144,7 +144,9 @@ impl Config {
                     ("limit_param", "per-page"),
                     ("results_path", "results"),
                     ("title_field", "title"),
-                    ("url_field", "doi"),
+                    ("url_field", "primary_location.landing_page_url"),
+                    ("fallback_url_field", "doi"),
+                    ("fallback_url_template", "https://doi.org/{value}"),
                 ],
             ),
             (
@@ -248,6 +250,11 @@ impl Config {
                     ("results_path", "hits"),
                     ("title_field", "title"),
                     ("url_field", "url"),
+                    ("fallback_url_field", "objectID"),
+                    (
+                        "fallback_url_template",
+                        "https://news.ycombinator.com/item?id={value}",
+                    ),
                     ("snippet_field", "story_text"),
                 ],
             ),
