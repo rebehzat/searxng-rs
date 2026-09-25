@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::path::Path;
@@ -19,6 +20,15 @@ fn main() {
         })
         .collect::<Vec<_>>();
     modules.sort();
+
+    let mut module_identifiers = HashSet::new();
+    for module in &modules {
+        let ident = rust_module_ident(module);
+        assert!(
+            module_identifiers.insert(ident.clone()),
+            "engine catalog filenames generate duplicate Rust module identifier '{ident}'"
+        );
+    }
 
     let generated = modules
         .iter()

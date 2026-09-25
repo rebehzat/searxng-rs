@@ -32,7 +32,21 @@ include!(concat!(env!("OUT_DIR"), "/catalog.rs"));
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
+
+    #[test]
+    fn catalog_entries_have_unique_names() {
+        let mut names = HashSet::new();
+        for entry in definitions() {
+            assert!(
+                names.insert(entry.name),
+                "duplicate engine catalog name '{}'",
+                entry.name
+            );
+        }
+    }
 
     fn entry(name: &str) -> CatalogEntry {
         definitions()
