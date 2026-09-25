@@ -1,6 +1,6 @@
 pub fn definition() -> crate::engines::catalog::CatalogEntry {
     crate::engine_catalog_entry!("bandcamp", "html_scrape", enabled = false, [
-        "endpoint" => "https://bandcamp.com/",
+        "endpoint" => "https://bandcamp.com/search",
         "query_param" => "q",
         "param_page" => "1",
         "result_selector" => "li.searchresult",

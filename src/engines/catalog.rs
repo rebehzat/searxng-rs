@@ -29,3 +29,66 @@ macro_rules! engine_catalog_entry {
 }
 
 include!(concat!(env!("OUT_DIR"), "/catalog.rs"));
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(name: &str) -> CatalogEntry {
+        definitions()
+            .into_iter()
+            .find(|entry| entry.name == name)
+            .unwrap_or_else(|| panic!("missing catalog entry {name}"))
+    }
+
+    fn param(name: &str, key: &str) -> String {
+        entry(name)
+            .params
+            .into_iter()
+            .find_map(|(param, value)| (param == key).then(|| value.to_owned()))
+            .unwrap_or_else(|| panic!("missing {key} parameter for {name}"))
+    }
+
+    #[test]
+    fn safety_sensitive_catalog_entries_are_disabled_by_default() {
+        for name in [
+            "unsplash",
+            "deviantart",
+            "openverse",
+            "crates",
+            "huggingface",
+            "mwmbl",
+        ] {
+            assert!(!entry(name).enabled, "{name} must be disabled by default");
+        }
+    }
+
+    #[test]
+    fn html_catalog_entries_use_provider_search_shapes() {
+        let deviantart = entry("deviantart");
+        assert_eq!(
+            deviantart
+                .params
+                .iter()
+                .find_map(|(key, value)| (*key == "result_selector").then_some(*value)),
+            Some("div[data-testid=\"content_row\"]")
+        );
+        assert_eq!(param("deviantart", "link_selector"), "a[href][aria-label]");
+        assert_eq!(param("deviantart", "title_attr"), "aria-label");
+        assert_eq!(param("bandcamp", "endpoint"), "https://bandcamp.com/search");
+        assert_eq!(param("bandcamp", "result_selector"), "li.searchresult");
+        assert_eq!(param("bandcamp", "link_selector"), ".itemurl a");
+    }
+
+    #[test]
+    fn json_catalog_entries_request_normalized_fields() {
+        assert_eq!(param("dailymotion", "limit_param"), "limit");
+        assert_eq!(param("dailymotion", "normalize_snippet_html"), "true");
+        assert_eq!(param("dailymotion", "snippet_max_length"), "300");
+        assert_eq!(param("mwmbl", "array_value_field"), "value");
+        assert_eq!(param("peertube", "snippet_field"), "description");
+        assert_eq!(param("sepiasearch", "snippet_field"), "description");
+        assert_eq!(param("europepmc", "normalize_title_html"), "true");
+        assert_eq!(param("europepmc", "normalize_snippet_html"), "true");
+    }
+}

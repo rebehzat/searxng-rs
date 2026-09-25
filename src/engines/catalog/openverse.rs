@@ -1,5 +1,5 @@
 pub fn definition() -> crate::engines::catalog::CatalogEntry {
-    crate::engine_catalog_entry!("openverse", "json_api", [
+    crate::engine_catalog_entry!("openverse", "json_api", enabled = false, [
         "endpoint" => "https://api.openverse.org/v1/images/?format=json",
         "query_param" => "q",
         "limit_param" => "page_size",

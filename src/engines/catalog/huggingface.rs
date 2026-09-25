@@ -1,5 +1,5 @@
 pub fn definition() -> crate::engines::catalog::CatalogEntry {
-    crate::engine_catalog_entry!("huggingface", "json_api", [
+    crate::engine_catalog_entry!("huggingface", "json_api", enabled = false, [
         "endpoint" => "https://huggingface.co/api/models?direction=-1",
         "query_param" => "search",
         "limit_param" => "limit",
