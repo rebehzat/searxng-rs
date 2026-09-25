@@ -54,7 +54,10 @@ async fn handle_connection(mut stream: TcpStream, config: Arc<Config>) -> Result
             return Ok(());
         }
         if let Some(pos) = find_head_end(&buf) {
-            break String::from_utf8_lossy(&buf[..pos]).into_owned();
+            let head = std::str::from_utf8(&buf[..pos]).map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "request head is not UTF-8")
+            })?;
+            break head.to_owned();
         }
     };
 
@@ -194,6 +197,15 @@ fn status_reason(status: u16) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_invalid_utf8_request_heads() {
+        let mut buf = b"GET /search?q=".to_vec();
+        buf.push(0xff);
+        buf.extend_from_slice(b" HTTP/1.1\r\n\r\n");
+        let pos = find_head_end(&buf).unwrap();
+        assert!(std::str::from_utf8(&buf[..pos]).is_err());
+    }
 
     #[test]
     fn parses_form_encoded_query_values() {
