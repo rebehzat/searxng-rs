@@ -9,15 +9,20 @@
 pub struct CatalogEntry {
     pub name: &'static str,
     pub engine_type: &'static str,
+    pub enabled: bool,
     pub params: Vec<(&'static str, &'static str)>,
 }
 
 #[macro_export]
 macro_rules! engine_catalog_entry {
     ($name:literal, $engine_type:literal, [$($key:literal => $value:literal),* $(,)?]) => {
+        $crate::engine_catalog_entry!($name, $engine_type, enabled = true, [$($key => $value),*])
+    };
+    ($name:literal, $engine_type:literal, enabled = $enabled:literal, [$($key:literal => $value:literal),* $(,)?]) => {
         $crate::engines::catalog::CatalogEntry {
             name: $name,
             engine_type: $engine_type,
+            enabled: $enabled,
             params: vec![$(($key, $value)),*],
         }
     };
