@@ -55,7 +55,7 @@ impl WikipediaRest {
                     format!(
                         "https://{}.wikipedia.org/wiki/{}",
                         self.language,
-                        item.title.replace(' ', "_")
+                        urlencoding::encode(&item.title.replace(' ', "_"))
                     ),
                     Some(strip_html(&item.snippet)),
                     metadata,
@@ -137,6 +137,21 @@ mod tests {
         assert_eq!(results[0].title, "Rust");
         assert_eq!(results[0].snippet.as_deref(), Some("A systems language"));
         assert_eq!(results[0].metadata["language"], "en");
+    }
+
+    #[test]
+    fn encodes_reserved_characters_in_article_urls() {
+        let e = WikipediaRest::new("wikipedia", "test/1", "en").unwrap();
+        let results = e
+            .parse_response(
+                r#"{"query":{"search":[{"title":"C# / Rust","snippet":"A title"}]}}"#,
+                5,
+            )
+            .unwrap();
+        assert_eq!(
+            results[0].url,
+            "https://en.wikipedia.org/wiki/C%23_%2F_Rust"
+        );
     }
 
     #[test]
