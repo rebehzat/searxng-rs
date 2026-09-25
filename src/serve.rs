@@ -58,14 +58,20 @@ async fn handle_connection(mut stream: TcpStream, config: Arc<Config>) -> Result
         }
     };
 
-    let Some(path) = head
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-    else {
+    let Some((method, path)) = parse_request_start(&head) else {
         respond(&mut stream, 400, r#"{"error":"bad request"}"#).await?;
         return Ok(());
     };
+    if method != "GET" {
+        respond_with_headers(
+            &mut stream,
+            405,
+            r#"{"error":"method not allowed"}"#,
+            &[("Allow", "GET")],
+        )
+        .await?;
+        return Ok(());
+    }
     debug!(%path, "request");
 
     let Some((route, query)) = path.split_once('?') else {
@@ -107,6 +113,11 @@ async fn handle_connection(mut stream: TcpStream, config: Arc<Config>) -> Result
     respond(&mut stream, 200, &serde_json::to_string(&body)?).await
 }
 
+fn parse_request_start(head: &str) -> Option<(&str, &str)> {
+    let mut parts = head.lines().next()?.split_whitespace();
+    Some((parts.next()?, parts.next()?))
+}
+
 /// Locate `\r\n\r\n` separating head from body.
 fn find_head_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
@@ -137,19 +148,60 @@ fn parse_query(query: &str) -> Vec<(String, String)> {
 }
 
 async fn respond(stream: &mut TcpStream, status: u16, body: &str) -> Result<()> {
-    let reason = match status {
-        200 => "OK",
-        400 => "Bad Request",
-        404 => "Not Found",
-        431 => "Request Header Fields Too Large",
-        _ => "Internal Server Error",
-    };
+    respond_with_headers(stream, status, body, &[]).await
+}
+
+async fn respond_with_headers(
+    stream: &mut TcpStream,
+    status: u16,
+    body: &str,
+    headers: &[(&str, &str)],
+) -> Result<()> {
+    let reason = status_reason(status);
+    let extra_headers = headers
+        .iter()
+        .map(|(name, value)| format!("{name}: {value}\r\n"))
+        .collect::<String>();
     let head = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{extra_headers}Connection: close\r\n\r\n",
         body.len()
     );
     stream.write_all(head.as_bytes()).await?;
     stream.write_all(body.as_bytes()).await?;
     stream.flush().await?;
     Ok(())
+}
+
+fn status_reason(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        400 => "Bad Request",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        431 => "Request Header Fields Too Large",
+        _ => "Internal Server Error",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_method_and_request_target() {
+        assert_eq!(
+            parse_request_start("GET /search?q=rust HTTP/1.1\r\n"),
+            Some(("GET", "/search?q=rust"))
+        );
+        assert_eq!(
+            parse_request_start("POST /search?q=rust HTTP/1.1\r\n"),
+            Some(("POST", "/search?q=rust"))
+        );
+        assert_eq!(parse_request_start("GET\r\n"), None);
+    }
+
+    #[test]
+    fn response_reason_includes_method_not_allowed() {
+        assert_eq!(status_reason(405), "Method Not Allowed");
+    }
 }
