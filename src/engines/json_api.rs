@@ -78,8 +78,18 @@ impl JsonApi {
             .filter_map(|item| {
                 let title = text_at(item, &self.title_field)?;
                 let mut url = text_at(item, &self.url_field)?;
-                if !self.url_prefix.is_empty() && url.starts_with('/') {
-                    url = format!("{}{}", self.url_prefix.trim_end_matches('/'), url);
+                if !self.url_prefix.is_empty() {
+                    if let Ok(parsed) = Url::parse(&url) {
+                        if !matches!(parsed.scheme(), "http" | "https") {
+                            return None;
+                        }
+                    } else {
+                        url = format!(
+                            "{}/{}",
+                            self.url_prefix.trim_end_matches('/'),
+                            url.trim_start_matches('/')
+                        );
+                    }
                 }
                 if title.is_empty() || url.is_empty() {
                     return None;
@@ -197,6 +207,24 @@ mod tests {
         .unwrap();
         let results = e.parse_value(serde_json::json!({"results":[{"title":"A","url":"/a"}]}), 1);
         assert_eq!(results[0].url, "https://example.test/a");
+    }
+
+    #[test]
+    fn applies_url_prefix_to_bare_identifiers() {
+        let e = JsonApi::from_config(
+            "api",
+            &config(&[
+                ("endpoint", "https://example.test"),
+                ("url_prefix", "https://archive.org/details"),
+            ]),
+            "test/1",
+        )
+        .unwrap();
+        let results = e.parse_value(
+            serde_json::json!({"results":[{"title":"A","url":"item-1"}]}),
+            1,
+        );
+        assert_eq!(results[0].url, "https://archive.org/details/item-1");
     }
 
     #[test]
