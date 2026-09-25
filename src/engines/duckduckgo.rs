@@ -151,14 +151,23 @@ fn web_url(candidate: impl AsRef<str>) -> Option<String> {
 
 /// Extract and percent-decode the `uddg` query parameter of a DDG redirect.
 fn decode_uddg(href: &str) -> Option<String> {
-    let path = href.strip_prefix("//").unwrap_or(href);
-    let idx = path.find("/l/?")?;
-    let query = &path[idx + "/l/?".len()..];
-    for pair in query.split('&') {
-        let (k, v) = pair.split_once('=')?;
-        if k == "uddg" {
-            let decoded = urlencoding::decode(v).ok()?;
-            return Some(decoded.into_owned());
+    let redirect = if let Some(rest) = href.strip_prefix("//") {
+        Url::parse(&format!("https://{rest}")).ok()?
+    } else {
+        Url::parse(href).ok()?
+    };
+    if !matches!(redirect.scheme(), "http" | "https")
+        || !matches!(
+            redirect.host_str(),
+            Some("duckduckgo.com" | "www.duckduckgo.com" | "html.duckduckgo.com")
+        )
+        || redirect.path() != "/l/"
+    {
+        return None;
+    }
+    for (key, value) in redirect.query_pairs() {
+        if key == "uddg" {
+            return Some(value.into_owned());
         }
     }
     None
@@ -249,6 +258,14 @@ mod tests {
             Some("https://a.example/b")
         );
         assert_eq!(decode_uddg("https://example.com/"), None);
+        assert_eq!(
+            decode_uddg("https://attacker.example/l/?uddg=https%3A%2F%2Ftarget.example%2F"),
+            None
+        );
+        assert_eq!(
+            decode_uddg("//duckduckgo.com/l/?uddg=https%3A%2F%2Ftarget.example%2F").as_deref(),
+            Some("https://target.example/")
+        );
         assert_eq!(
             absolutize_ddg_href("//example.com/x").as_deref(),
             Some("https://example.com/x")
