@@ -28,6 +28,7 @@ pub struct JsonApi {
     url_field: String,
     url_prefix: String,
     url_template: Option<String>,
+    url_source_field: Option<String>,
     snippet_field: String,
     api_key: Option<(String, String)>,
 }
@@ -59,6 +60,8 @@ impl JsonApi {
             url_prefix: cfg.string_param("url_prefix", ""),
             url_template: (!cfg.string_param("url_template", "").is_empty())
                 .then(|| cfg.string_param("url_template", "")),
+            url_source_field: (!cfg.string_param("url_source_field", "").is_empty())
+                .then(|| cfg.string_param("url_source_field", "")),
             snippet_field: cfg.string_param("snippet_field", "snippet"),
             api_key,
         })
@@ -82,7 +85,15 @@ impl JsonApi {
                 let title = text_at(item, &self.title_field)?;
                 let mut url = text_at(item, &self.url_field)?;
                 if let Some(template) = &self.url_template {
-                    url = template.replace("{value}", &url).replace("{url}", &url);
+                    let source = self
+                        .url_source_field
+                        .as_deref()
+                        .and_then(|field| text_at(item, field))
+                        .unwrap_or_default();
+                    url = template
+                        .replace("{value}", &url)
+                        .replace("{url}", &url)
+                        .replace("{source}", &source);
                 }
                 if !self.url_prefix.is_empty() {
                     if let Ok(parsed) = Url::parse(&url) {
@@ -246,6 +257,28 @@ mod tests {
         .unwrap();
         let results = e.parse_value(
             serde_json::json!({"results":[{"title":"A","url":"MED/123"}]}),
+            1,
+        );
+        assert_eq!(results[0].url, "https://europepmc.org/article/MED/123");
+    }
+
+    #[test]
+    fn applies_url_template_with_a_source_field() {
+        let e = JsonApi::from_config(
+            "api",
+            &config(&[
+                ("endpoint", "https://example.test"),
+                (
+                    "url_template",
+                    "https://europepmc.org/article/{source}/{value}",
+                ),
+                ("url_source_field", "source"),
+            ]),
+            "test/1",
+        )
+        .unwrap();
+        let results = e.parse_value(
+            serde_json::json!({"results":[{"title":"A","source":"MED","url":"123"}]}),
             1,
         );
         assert_eq!(results[0].url, "https://europepmc.org/article/MED/123");
