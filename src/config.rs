@@ -4,7 +4,7 @@
 //! [`Config::builtin_defaults`], which enables the two bundled adapters
 //! (`ddg_html` and `wikipedia`).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -371,18 +371,22 @@ impl Config {
         let mut selected = Vec::new();
         let mut unknown = Vec::new();
         match requested {
-            Some(names) if !names.is_empty() => {
+            Some(names) => {
+                let mut seen = HashSet::new();
                 for name in names {
+                    if !seen.insert(name) {
+                        continue;
+                    }
                     match self.engines.get(name) {
                         Some(ec) if ec.enabled => {
                             selected.push((name.clone(), ec.clone()));
                         }
-                        Some(_) => unknown.push(name.clone()), // disabled counts as unavailable
+                        Some(_) => unknown.push(name.clone()),
                         None => unknown.push(name.clone()),
                     }
                 }
             }
-            _ => {
+            None => {
                 for (name, ec) in &self.engines {
                     if ec.enabled {
                         selected.push((name.clone(), ec.clone()));
@@ -458,6 +462,28 @@ enabled = false
         let missing = PathBuf::from("definitely-missing-searxng-rs-config.toml");
         let error = Config::resolve(Some(&missing)).unwrap_err().to_string();
         assert!(error.contains("cannot read config"));
+    }
+
+    #[test]
+    fn explicit_empty_selection_does_not_run_all_engines() {
+        let cfg = Config::from_toml_str(SAMPLE).unwrap();
+        let (selected, unknown) = cfg.select_engines(Some(&[]));
+        assert!(selected.is_empty());
+        assert!(unknown.is_empty());
+    }
+
+    #[test]
+    fn duplicate_engine_names_are_selected_once() {
+        let cfg = Config::from_toml_str(SAMPLE).unwrap();
+        let names = vec![
+            "ddg_html".into(),
+            "ddg_html".into(),
+            "nope".into(),
+            "nope".into(),
+        ];
+        let (selected, unknown) = cfg.select_engines(Some(&names));
+        assert_eq!(selected.len(), 1);
+        assert_eq!(unknown, vec!["nope"]);
     }
 
     #[test]
