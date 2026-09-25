@@ -5,5 +5,6 @@ pub fn definition() -> crate::engines::catalog::CatalogEntry {
         "results_path" => "data",
         "title_field" => "name",
         "url_field" => "url",
+        "snippet_field" => "description",
     ])
 }

@@ -1,5 +1,5 @@
 pub fn definition() -> crate::engines::catalog::CatalogEntry {
-    crate::engine_catalog_entry!("crates", "json_api", [
+    crate::engine_catalog_entry!("crates", "json_api", enabled = false, [
         "endpoint" => "https://crates.io/api/v1/crates",
         "query_param" => "q",
         "limit_param" => "per_page",

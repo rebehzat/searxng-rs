@@ -5,9 +5,11 @@ pub fn definition() -> crate::engines::catalog::CatalogEntry {
         "limit_param" => "pageSize",
         "results_path" => "resultList.result",
         "title_field" => "title",
+        "normalize_title_html" => "true",
         "url_field" => "id",
         "url_template" => "https://europepmc.org/article/{source}/{value}",
         "url_source_field" => "source",
         "snippet_field" => "abstractText",
+        "normalize_snippet_html" => "true",
     ])
 }

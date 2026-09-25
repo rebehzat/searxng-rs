@@ -485,6 +485,37 @@ enabled = false
     }
 
     #[test]
+    fn disabled_catalog_entries_stay_disabled_during_selection() {
+        let cfg = Config::builtin_defaults();
+        let disabled = [
+            "unsplash",
+            "deviantart",
+            "openverse",
+            "crates",
+            "huggingface",
+            "mwmbl",
+        ];
+        for name in disabled {
+            assert!(!cfg.engines[name].enabled, "{name} should be disabled");
+        }
+
+        let requested = disabled
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect::<Vec<_>>();
+        let (selected, unknown) = cfg.select_engines(Some(&requested));
+        assert!(selected.is_empty());
+        assert_eq!(unknown, requested);
+
+        let (selected, _) = cfg.select_engines(None);
+        assert!(
+            disabled
+                .iter()
+                .all(|name| !selected.iter().any(|(selected, _)| selected == name))
+        );
+    }
+
+    #[test]
     fn dash_path_is_reserved_for_stdin() {
         // Keep the path handling testable without replacing process stdin.
         let path = PathBuf::from("-");

@@ -31,6 +31,7 @@ pub struct HtmlScrape {
     result_selector: Selector,
     link_selector: Selector,
     title_selector: Option<Selector>,
+    title_attribute: Option<String>,
     snippet_selector: Option<Selector>,
     link_url_attr: String,
 }
@@ -100,6 +101,7 @@ impl HtmlScrape {
             anyhow::bail!("engine '{name}' requires a link_selector");
         }
         let title_selector = cfg.string_param("title_selector", "");
+        let title_attribute = cfg.string_param("title_attr", "");
         let snippet_selector = cfg.string_param("snippet_selector", "");
         let extra_params = {
             let mut params: Vec<(String, String)> = cfg
@@ -131,6 +133,7 @@ impl HtmlScrape {
                     })
                 })
                 .transpose()?,
+            title_attribute: (!title_attribute.is_empty()).then_some(title_attribute),
             snippet_selector: (!snippet_selector.is_empty())
                 .then(|| {
                     Selector::parse(&snippet_selector).map_err(|e| {
@@ -166,11 +169,23 @@ impl HtmlScrape {
             let Some(link) = element.select(&self.link_selector).next() else {
                 continue;
             };
-            let title = self
+            let title_element = self
                 .title_selector
                 .as_ref()
-                .and_then(|selector| element.select(selector).next())
-                .map(|title| normalize_ws(&title.text().collect::<String>()))
+                .and_then(|selector| element.select(selector).next());
+            let title = self
+                .title_attribute
+                .as_deref()
+                .and_then(|attribute| {
+                    title_element
+                        .and_then(|title| title.value().attr(attribute))
+                        .or_else(|| link.value().attr(attribute))
+                })
+                .map(normalize_ws)
+                .filter(|title| !title.is_empty())
+                .or_else(|| {
+                    title_element.map(|title| normalize_ws(&title.text().collect::<String>()))
+                })
                 .filter(|title| !title.is_empty())
                 .unwrap_or_else(|| normalize_ws(&link.text().collect::<String>()));
             if title.is_empty() {
@@ -349,6 +364,34 @@ mod tests {
         let html = r#"<li class="b_algo"><h2><a href="https://example.test"><span class="title">Primary title</span> Extra text</a></h2></li>"#;
         let results = cfg.parse_html(&cfg.build_url("rust"), html);
         assert_eq!(results[0].0, "Primary title");
+    }
+
+    #[test]
+    fn uses_link_title_attribute_when_configured() {
+        let mut params = std::collections::BTreeMap::new();
+        for (key, value) in [
+            ("endpoint", "https://www.deviantart.com/search"),
+            ("query_param", "q"),
+            ("result_selector", "div[data-testid=\"content_row\"]"),
+            ("link_selector", "a[href][aria-label]"),
+            ("title_attr", "aria-label"),
+        ] {
+            params.insert(key.to_string(), toml::Value::from(value));
+        }
+        let engine = HtmlScrape::from_config(
+            "deviantart",
+            &EngineConfig {
+                engine_type: "html_scrape".into(),
+                enabled: false,
+                params,
+            },
+            "searxng-rs/test",
+        )
+        .unwrap();
+        let html = r#"<div data-testid="content_row"><a href="/art" aria-label="  A <em>bright</em> artwork  "><img data-testid="thumb"></a></div>"#;
+        let results = engine.parse_html(&engine.build_url("rust"), html);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, "A <em>bright</em> artwork");
     }
 
     #[test]
