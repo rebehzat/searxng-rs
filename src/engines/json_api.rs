@@ -29,6 +29,8 @@ pub struct JsonApi {
     url_prefix: String,
     url_template: Option<String>,
     url_source_field: Option<String>,
+    fallback_url_field: Option<String>,
+    fallback_url_template: Option<String>,
     snippet_field: String,
     api_key: Option<(String, String)>,
 }
@@ -62,6 +64,10 @@ impl JsonApi {
                 .then(|| cfg.string_param("url_template", "")),
             url_source_field: (!cfg.string_param("url_source_field", "").is_empty())
                 .then(|| cfg.string_param("url_source_field", "")),
+            fallback_url_field: (!cfg.string_param("fallback_url_field", "").is_empty())
+                .then(|| cfg.string_param("fallback_url_field", "")),
+            fallback_url_template: (!cfg.string_param("fallback_url_template", "").is_empty())
+                .then(|| cfg.string_param("fallback_url_template", "")),
             snippet_field: cfg.string_param("snippet_field", "snippet"),
             api_key,
         })
@@ -83,7 +89,12 @@ impl JsonApi {
             .take(limit)
             .filter_map(|item| {
                 let title = text_at(item, &self.title_field)?;
-                let mut url = text_at(item, &self.url_field)?;
+                let mut url = text_at(item, &self.url_field).or_else(|| {
+                    let field = self.fallback_url_field.as_deref()?;
+                    let value = text_at(item, field)?;
+                    let template = self.fallback_url_template.as_deref()?;
+                    Some(template.replace("{value}", &value).replace("{url}", &value))
+                })?;
                 if let Some(template) = &self.url_template {
                     let source = self
                         .url_source_field
@@ -282,6 +293,28 @@ mod tests {
             1,
         );
         assert_eq!(results[0].url, "https://europepmc.org/article/MED/123");
+    }
+
+    #[test]
+    fn uses_fallback_url_when_primary_url_is_missing() {
+        let e = JsonApi::from_config(
+            "api",
+            &config(&[
+                ("endpoint", "https://example.test"),
+                ("fallback_url_field", "objectID"),
+                (
+                    "fallback_url_template",
+                    "https://news.ycombinator.com/item?id={value}",
+                ),
+            ]),
+            "test/1",
+        )
+        .unwrap();
+        let results = e.parse_value(
+            serde_json::json!({"results":[{"title":"Ask HN","objectID":"42","url":null}]}),
+            1,
+        );
+        assert_eq!(results[0].url, "https://news.ycombinator.com/item?id=42");
     }
 
     #[test]
