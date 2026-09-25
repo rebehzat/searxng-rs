@@ -283,6 +283,7 @@ impl Config {
                     ("endpoint", "https://www.googleapis.com/books/v1/volumes"),
                     ("query_param", "q"),
                     ("limit_param", "maxResults"),
+                    ("max_limit", "40"),
                     ("results_path", "items"),
                     ("title_field", "volumeInfo.title"),
                     ("url_field", "volumeInfo.infoLink"),
