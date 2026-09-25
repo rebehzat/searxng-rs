@@ -1,5 +1,6 @@
 //! Engine abstraction and the built-in registry.
 
+pub mod catalog;
 pub mod duckduckgo;
 pub mod html_scrape;
 pub mod json_api;

@@ -76,7 +76,7 @@ type EngineDefinition<'a> = (&'a str, &'a str, Vec<(&'a str, &'a str)>);
 impl Config {
     /// The configuration used when no file is present.
     pub fn builtin_defaults() -> Self {
-        let definitions: Vec<EngineDefinition<'_>> = vec![
+        let mut definitions: Vec<EngineDefinition<'_>> = vec![
             (
                 "bing",
                 "html_scrape",
@@ -300,6 +300,11 @@ impl Config {
                 ],
             ),
         ];
+        definitions.extend(
+            crate::engines::catalog::definitions()
+                .into_iter()
+                .map(|entry| (entry.name, entry.engine_type, entry.params)),
+        );
         let engines = definitions
             .into_iter()
             .map(|(name, ty, params)| {
