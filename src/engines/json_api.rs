@@ -27,6 +27,7 @@ pub struct JsonApi {
     title_field: String,
     url_field: String,
     url_prefix: String,
+    url_template: Option<String>,
     snippet_field: String,
     api_key: Option<(String, String)>,
 }
@@ -56,6 +57,8 @@ impl JsonApi {
             title_field: cfg.string_param("title_field", "title"),
             url_field: cfg.string_param("url_field", "url"),
             url_prefix: cfg.string_param("url_prefix", ""),
+            url_template: (!cfg.string_param("url_template", "").is_empty())
+                .then(|| cfg.string_param("url_template", "")),
             snippet_field: cfg.string_param("snippet_field", "snippet"),
             api_key,
         })
@@ -78,6 +81,9 @@ impl JsonApi {
             .filter_map(|item| {
                 let title = text_at(item, &self.title_field)?;
                 let mut url = text_at(item, &self.url_field)?;
+                if let Some(template) = &self.url_template {
+                    url = template.replace("{value}", &url).replace("{url}", &url);
+                }
                 if !self.url_prefix.is_empty() {
                     if let Ok(parsed) = Url::parse(&url) {
                         if !matches!(parsed.scheme(), "http" | "https") {
@@ -225,6 +231,24 @@ mod tests {
             1,
         );
         assert_eq!(results[0].url, "https://archive.org/details/item-1");
+    }
+
+    #[test]
+    fn applies_url_template_to_bare_identifiers() {
+        let e = JsonApi::from_config(
+            "api",
+            &config(&[
+                ("endpoint", "https://example.test"),
+                ("url_template", "https://europepmc.org/article/{value}"),
+            ]),
+            "test/1",
+        )
+        .unwrap();
+        let results = e.parse_value(
+            serde_json::json!({"results":[{"title":"A","url":"MED/123"}]}),
+            1,
+        );
+        assert_eq!(results[0].url, "https://europepmc.org/article/MED/123");
     }
 
     #[test]
