@@ -23,8 +23,9 @@ fn main() {
     let generated = modules
         .iter()
         .map(|module| {
+            let ident = rust_module_ident(module);
             format!(
-                "mod {module} {{ include!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/src/engines/catalog/{module}.rs\")); }}\n"
+                "mod {ident} {{ include!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/src/engines/catalog/{module}.rs\")); }}\n"
             )
         })
         .chain(std::iter::once(
@@ -32,11 +33,24 @@ fn main() {
                 .to_string(),
         ))
         .chain(modules.iter().map(|module| {
-            format!("        {module}::definition(),\n")
+            let ident = rust_module_ident(module);
+            format!("        {ident}::definition(),\n")
         }))
         .chain(std::iter::once("    ]\n}\n".to_string()))
         .collect::<String>();
 
     let out = Path::new(&env::var("OUT_DIR").expect("OUT_DIR")).join("catalog.rs");
     fs::write(out, generated).expect("write generated engine catalog");
+}
+
+fn rust_module_ident(module: &str) -> String {
+    let mut ident = String::from("engine_");
+    for character in module.chars() {
+        assert!(
+            character.is_ascii_alphanumeric() || character == '_',
+            "engine catalog filename '{module}' is not a safe Rust module name"
+        );
+        ident.push(character.to_ascii_lowercase());
+    }
+    ident
 }
