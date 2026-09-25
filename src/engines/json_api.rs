@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use reqwest::Url;
 use serde_json::Value;
 
 use crate::config::EngineConfig;
@@ -83,6 +84,7 @@ impl JsonApi {
                 if title.is_empty() || url.is_empty() {
                     return None;
                 }
+                let url = normalized_web_url(&url)?;
                 let snippet = text_at(item, &self.snippet_field).filter(|s| !s.is_empty());
                 Some(SearchResult::with_metadata(
                     self.name.clone(),
@@ -124,6 +126,11 @@ impl Engine for JsonApi {
         let value: Value = serde_json::from_str(&body).map_err(|_| EngineError::Parse)?;
         Ok(self.parse_value(value, limit))
     }
+}
+
+fn normalized_web_url(candidate: &str) -> Option<String> {
+    let url = Url::parse(candidate).ok()?;
+    matches!(url.scheme(), "http" | "https").then(|| url.to_string())
 }
 
 fn value_at<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
@@ -174,7 +181,7 @@ mod tests {
         let value = serde_json::json!({"message":{"items":[{"title":["Rust"],"links":{"html":"https://rust-lang.org"}}]}});
         let results = e.parse_value(value, 5);
         assert_eq!(results[0].title, "Rust");
-        assert_eq!(results[0].url, "https://rust-lang.org");
+        assert_eq!(results[0].url, "https://rust-lang.org/");
     }
 
     #[test]
@@ -190,6 +197,24 @@ mod tests {
         .unwrap();
         let results = e.parse_value(serde_json::json!({"results":[{"title":"A","url":"/a"}]}), 1);
         assert_eq!(results[0].url, "https://example.test/a");
+    }
+
+    #[test]
+    fn rejects_non_web_result_urls() {
+        let e = JsonApi::from_config(
+            "api",
+            &config(&[("endpoint", "https://example.test")]),
+            "test/1",
+        )
+        .unwrap();
+        for url in [
+            "javascript:alert(1)",
+            "file:///etc/passwd",
+            "data:text/html,x",
+        ] {
+            let value = serde_json::json!({"results":[{"title":"unsafe","url":url}]});
+            assert!(e.parse_value(value, 5).is_empty(), "accepted {url}");
+        }
     }
 
     #[test]

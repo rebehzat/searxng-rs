@@ -135,16 +135,19 @@ fn absolutize_ddg_href(href: &str) -> Option<String> {
     }
 
     if let Some(decoded) = decode_uddg(href) {
-        return Some(decoded);
+        return web_url(decoded);
     }
 
     if href.starts_with("//") {
-        return Some(format!("https:{href}"));
+        return web_url(format!("https:{href}"));
     }
-    if href.starts_with("http://") || href.starts_with("https://") {
-        return Some(href.to_string());
-    }
-    None
+    web_url(href)
+}
+
+/// Accept only absolute HTTP(S) URLs suitable for normalized search results.
+fn web_url(candidate: impl AsRef<str>) -> Option<String> {
+    let url = Url::parse(candidate.as_ref()).ok()?;
+    matches!(url.scheme(), "http" | "https").then(|| url.to_string())
 }
 
 /// Extract and percent-decode the `uddg` query parameter of a DDG redirect.
@@ -248,5 +251,18 @@ mod tests {
             Some("https://example.com/y")
         );
         assert_eq!(absolutize_ddg_href(""), None);
+    }
+
+    #[test]
+    fn rejects_non_web_redirect_targets() {
+        assert_eq!(
+            absolutize_ddg_href("//duckduckgo.com/l/?uddg=javascript%3Aalert%281%29"),
+            None
+        );
+        assert_eq!(
+            absolutize_ddg_href("//duckduckgo.com/l/?uddg=file%3A%2F%2F%2Fetc%2Fpasswd"),
+            None
+        );
+        assert_eq!(absolutize_ddg_href("data:text/html,not-a-result"), None);
     }
 }
