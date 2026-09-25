@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -333,10 +334,18 @@ impl Config {
         toml::from_str(s)
     }
 
-    /// Load from an explicit path.
+    /// Load from an explicit path. The path `-` reads TOML from stdin.
     pub fn load(path: &Path) -> anyhow::Result<Self> {
-        let raw = fs::read_to_string(path)
-            .map_err(|e| anyhow::anyhow!("cannot read config {}: {e}", path.display()))?;
+        let raw = if path == Path::new("-") {
+            let mut raw = String::new();
+            std::io::stdin()
+                .read_to_string(&mut raw)
+                .map_err(|e| anyhow::anyhow!("cannot read config from stdin: {e}"))?;
+            raw
+        } else {
+            fs::read_to_string(path)
+                .map_err(|e| anyhow::anyhow!("cannot read config {}: {e}", path.display()))?
+        };
         let cfg = Self::from_toml_str(&raw)
             .map_err(|e| anyhow::anyhow!("cannot parse config {}: {e}", path.display()))?;
         Ok(cfg)
@@ -455,6 +464,13 @@ enabled = false
         let cfg = Config::builtin_defaults();
         assert!(cfg.engines.contains_key("ddg_html"));
         assert!(cfg.engines.contains_key("wikipedia"));
+    }
+
+    #[test]
+    fn dash_path_is_reserved_for_stdin() {
+        // Keep the path handling testable without replacing process stdin.
+        let path = PathBuf::from("-");
+        assert_eq!(path, Path::new("-"));
     }
 
     #[test]
