@@ -18,11 +18,8 @@
 // lookup, and the latitude/longitude map URL that upstream uses when a place
 // carries no `osm_id` (such places are dropped here instead of being given a
 // synthesized link). Places without `osm_id`/`osm_type` are therefore skipped.
-//
-// Disabled by default: Nominatim's usage policy requires a conservative
-// request rate, so it is opt-in.
 pub fn definition() -> crate::engines::catalog::CatalogEntry {
-    crate::engine_catalog_entry!("openstreetmap", "json_api", enabled = false, [
+    crate::engine_catalog_entry!("openstreetmap", "json_api", [
         "endpoint" => "https://nominatim.openstreetmap.org/search?polygon_geojson=1&format=jsonv2&addressdetails=1&extratags=1&dedupe=1",
         "query_param" => "q",
         "title_field" => "display_name",
