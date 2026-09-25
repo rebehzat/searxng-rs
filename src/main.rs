@@ -95,7 +95,7 @@ struct EngineInfo {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let config = Config::resolve(cli.config.as_ref());
+    let config = Config::resolve(cli.config.as_ref())?;
 
     if cli.agent {
         return run_agent(config).await;

@@ -339,24 +339,22 @@ impl Config {
 
     /// Resolve the effective configuration: explicit `--config` path wins,
     /// then `./searxng-rs.toml`, then built-in defaults.
-    pub fn resolve(explicit: Option<&PathBuf>) -> Self {
+    ///
+    /// An explicitly requested configuration is part of the user's command,
+    /// so a missing or malformed file is fatal. An automatically discovered
+    /// local file remains best-effort for backwards compatibility.
+    pub fn resolve(explicit: Option<&PathBuf>) -> anyhow::Result<Self> {
         if let Some(p) = explicit {
-            match Self::load(p) {
-                Ok(cfg) => return cfg,
-                Err(e) => {
-                    warn!("{e}");
-                    return Self::builtin_defaults();
-                }
-            }
+            return Self::load(p);
         }
         let local = PathBuf::from("searxng-rs.toml");
         if local.is_file() {
             match Self::load(&local) {
-                Ok(cfg) => return cfg,
+                Ok(cfg) => return Ok(cfg),
                 Err(e) => warn!("{e}; falling back to built-in defaults"),
             }
         }
-        Self::builtin_defaults()
+        Ok(Self::builtin_defaults())
     }
 
     /// Enabled engine configs, optionally filtered by explicit names.
@@ -448,6 +446,13 @@ enabled = false
         let cfg = Config::builtin_defaults();
         assert!(cfg.engines.contains_key("ddg_html"));
         assert!(cfg.engines.contains_key("wikipedia"));
+    }
+
+    #[test]
+    fn explicit_missing_config_is_an_error() {
+        let missing = PathBuf::from("definitely-missing-searxng-rs-config.toml");
+        let error = Config::resolve(Some(&missing)).unwrap_err().to_string();
+        assert!(error.contains("cannot read config"));
     }
 
     #[test]
