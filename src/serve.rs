@@ -82,18 +82,32 @@ async fn handle_connection(mut stream: TcpStream, config: Arc<Config>) -> Result
         respond(&mut stream, 404, r#"{"error":"not found"}"#).await?;
         return Ok(());
     }
-    let params = parse_query(query);
+    let params = match parse_query(query) {
+        Ok(params) => params,
+        Err(()) => {
+            respond(&mut stream, 400, r#"{"error":"invalid query encoding"}"#).await?;
+            return Ok(());
+        }
+    };
     let Some(q) = params.iter().find(|(k, _)| k == "q").map(|(_, v)| v) else {
         respond(&mut stream, 400, r#"{"error":"missing q"}"#).await?;
         return Ok(());
     };
+    if q.is_empty() {
+        respond(&mut stream, 400, r#"{"error":"empty q"}"#).await?;
+        return Ok(());
+    }
 
-    let limit = params
-        .iter()
-        .find(|(k, _)| k == "limit")
-        .and_then(|(_, v)| v.parse::<usize>().ok())
-        .map(|l| l.clamp(1, 100))
-        .unwrap_or(10);
+    let limit = match params.iter().find(|(k, _)| k == "limit") {
+        Some((_, value)) => match value.parse::<usize>() {
+            Ok(limit) if (1..=100).contains(&limit) => limit,
+            _ => {
+                respond(&mut stream, 400, r#"{"error":"invalid limit"}"#).await?;
+                return Ok(());
+            }
+        },
+        None => 10,
+    };
 
     let response = run_search(config.as_ref(), q, None, limit, None).await;
     let body = json!({
@@ -124,27 +138,21 @@ fn find_head_end(buf: &[u8]) -> Option<usize> {
 }
 
 /// Minimal `application/x-www-form-urlencoded` query parser.
-fn parse_query(query: &str) -> Vec<(String, String)> {
+fn parse_query(query: &str) -> Result<Vec<(String, String)>, ()> {
     query
         .split('&')
         .filter(|pair| !pair.is_empty())
         .map(|pair| match pair.split_once('=') {
-            Some((k, v)) => (
-                urlencoding::decode(k)
-                    .map(|v| v.into_owned())
-                    .unwrap_or_default(),
-                urlencoding::decode(v)
-                    .map(|v| v.into_owned())
-                    .unwrap_or_default(),
-            ),
-            None => (
-                urlencoding::decode(pair)
-                    .map(|v| v.into_owned())
-                    .unwrap_or_default(),
-                String::new(),
-            ),
+            Some((key, value)) => Ok((decode_form_component(key)?, decode_form_component(value)?)),
+            None => Ok((decode_form_component(pair)?, String::new())),
         })
         .collect()
+}
+
+fn decode_form_component(value: &str) -> Result<String, ()> {
+    Ok(urlencoding::decode(&value.replace('+', " "))
+        .map_err(|_| ())?
+        .into_owned())
 }
 
 async fn respond(stream: &mut TcpStream, status: u16, body: &str) -> Result<()> {
@@ -186,6 +194,19 @@ fn status_reason(status: u16) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_form_encoded_query_values() {
+        let params = parse_query("q=rust+language&lang=en%2DUS").unwrap();
+        assert_eq!(
+            params,
+            vec![
+                ("q".into(), "rust language".into()),
+                ("lang".into(), "en-US".into())
+            ]
+        );
+        assert!(parse_query("q=%FF").is_err());
+    }
 
     #[test]
     fn parses_method_and_request_target() {
