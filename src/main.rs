@@ -23,7 +23,7 @@ use serde::Serialize;
 
 use crate::config::Config;
 use crate::engines::{Engine, build_engine};
-use crate::models::{AgentRequest, AgentResponse, EngineStatus, SearchResponse};
+use crate::models::{AgentRequest, AgentResponse, EngineStatus, SearchResponse, SearchResult};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -258,23 +258,18 @@ async fn run_search(
     .await;
     responses.sort_by(|a, b| a.0.cmp(&b.0));
 
-    let mut merged = Vec::new();
-    let mut seen_urls = HashSet::new();
+    let mut successful = Vec::new();
     for (name, outcome) in responses {
         match outcome {
             Ok(results) => {
                 let count = results.len();
                 statuses.push(EngineStatus {
-                    name,
+                    name: name.clone(),
                     ok: true,
                     count,
                     error: None,
                 });
-                for result in results {
-                    if seen_urls.insert(result.url.clone()) {
-                        merged.push(result);
-                    }
-                }
+                successful.push((name, results));
             }
             Err(error) => statuses.push(EngineStatus {
                 name,
@@ -285,7 +280,7 @@ async fn run_search(
         }
     }
 
-    merged.truncate(limit);
+    let mut merged = merge_results(successful, limit);
     for (index, result) in merged.iter_mut().enumerate() {
         result.rank = index + 1;
         result.score = 1.0 / (index as f64 + 1.0);
@@ -298,6 +293,34 @@ async fn run_search(
         engines: statuses,
         elapsed_ms: started.elapsed().as_millis(),
     }
+}
+
+/// Merge provider results without allowing the first successful engine to
+/// consume the entire global limit. Providers are visited round-robin in
+/// their stable name order, preserving each provider's own result order.
+fn merge_results(batches: Vec<(String, Vec<SearchResult>)>, limit: usize) -> Vec<SearchResult> {
+    let max_results = batches
+        .iter()
+        .map(|(_, results)| results.len())
+        .max()
+        .unwrap_or(0);
+    let mut merged = Vec::with_capacity(limit);
+    let mut seen_urls = HashSet::new();
+
+    for rank in 0..max_results {
+        for (_, results) in &batches {
+            if let Some(result) = results.get(rank)
+                && seen_urls.insert(result.url.clone())
+            {
+                merged.push(result.clone());
+                if merged.len() == limit {
+                    return merged;
+                }
+            }
+        }
+    }
+
+    merged
 }
 
 fn print_text(response: &SearchResponse) {
@@ -324,6 +347,42 @@ mod tests {
     fn cli_accepts_agent_flag() {
         let cli = Cli::try_parse_from(["searxng-rs", "--agent"]).unwrap();
         assert!(cli.agent);
+    }
+
+    #[test]
+    fn merge_results_interleaves_engines_and_deduplicates() {
+        let batches = vec![
+            (
+                "alpha".to_string(),
+                vec![
+                    SearchResult::new("alpha", "A1", "https://example.test/a1", None),
+                    SearchResult::new("alpha", "A2", "https://example.test/a2", None),
+                ],
+            ),
+            (
+                "beta".to_string(),
+                vec![
+                    SearchResult::new("beta", "B1", "https://example.test/b1", None),
+                    SearchResult::new("beta", "duplicate", "https://example.test/a1", None),
+                ],
+            ),
+        ];
+
+        let merged = merge_results(batches, 4);
+        let titles: Vec<_> = merged.iter().map(|result| result.title.as_str()).collect();
+        assert_eq!(titles, ["A1", "B1", "A2"]);
+    }
+
+    #[test]
+    fn merge_results_stops_at_limit() {
+        let batches = vec![(
+            "alpha".to_string(),
+            vec![
+                SearchResult::new("alpha", "A1", "https://example.test/a1", None),
+                SearchResult::new("alpha", "A2", "https://example.test/a2", None),
+            ],
+        )];
+        assert_eq!(merge_results(batches, 1).len(), 1);
     }
 
     #[test]
