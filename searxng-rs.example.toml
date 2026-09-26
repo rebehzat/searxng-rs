@@ -12,3 +12,31 @@ enabled = true
 type = "duckduckgo_html"
 region = "wt-wt"
 enabled = true
+
+# A multi-page JSON API. Page n sends page_start + (n - 1) * page_step, and a
+# search stops as soon as it holds `limit` results, so a first page that
+# already satisfies the request still costs exactly one request.
+# All of these keys are optional and default to off.
+[engines.example_paged]
+type = "json_api"
+endpoint = "https://api.example.invalid/search"
+query_param = "q"
+results_path = "results"
+title_field = "title"
+url_field = "url"
+page_param = "offset"
+page_start = "0"
+page_step = "20"
+max_pages = "3"
+enabled = false
+
+# A search term in the URL path rather than the query string. The endpoint must
+# contain a literal {query}; it is percent-encoded so it can never introduce a
+# path segment, query string or fragment.
+[engines.example_path]
+type = "html_scrape"
+path_query = "true"
+endpoint = "https://example.invalid/words/{query}"
+result_selector = "div.result"
+link_selector = "a"
+enabled = false
