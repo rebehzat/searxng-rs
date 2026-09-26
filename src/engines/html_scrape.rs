@@ -26,6 +26,7 @@ pub struct HtmlScrape {
     name: String,
     client: reqwest::Client,
     endpoint: String,
+    path_query: bool,
     query_param: String,
     extra_params: Vec<(String, String)>,
     result_selector: Selector,
@@ -101,8 +102,8 @@ impl HtmlScrape {
         if endpoint.is_empty() {
             anyhow::bail!("engine '{name}' requires an endpoint");
         }
-        let endpoint_url = Url::parse(&endpoint)
-            .map_err(|error| anyhow::anyhow!("engine '{name}': invalid endpoint: {error}"))?;
+        let path_query = cfg.bool_param("path_query", false);
+        let endpoint_url = super::validate_endpoint(name, &endpoint, path_query)?;
         if !matches!(endpoint_url.scheme(), "http" | "https") {
             anyhow::bail!("engine '{name}': endpoint must use http or https");
         }
@@ -135,6 +136,7 @@ impl HtmlScrape {
             name: name.into(),
             client: reqwest::Client::builder().user_agent(user_agent).build()?,
             endpoint,
+            path_query,
             query_param: cfg.string_param("query_param", "q"),
             result_selector: Selector::parse(&result_selector)
                 .map_err(|e| anyhow::anyhow!("engine '{name}': invalid result_selector: {e:?}"))?,
@@ -160,17 +162,34 @@ impl HtmlScrape {
         })
     }
 
-    /// Build the request URL for a query.
+    /// Build the request URL for a query, panicking on an unusable endpoint.
+    ///
+    /// Test convenience wrapper: request handling uses
+    /// [`Self::try_build_url`], so only compiled when tests are built.
+    #[cfg(test)]
     pub fn build_url(&self, query: &str) -> Url {
-        let mut url = Url::parse(&self.endpoint).expect("configured endpoint is a valid URL");
-        {
+        self.try_build_url(query)
+            .expect("configured endpoint is a valid URL")
+    }
+
+    /// Build the request URL for a query, reporting an unusable endpoint
+    /// instead of panicking.
+    pub fn try_build_url(&self, query: &str) -> anyhow::Result<Url> {
+        let name = &self.name;
+        let mut url = super::resolve_endpoint(&self.endpoint, self.path_query, query)
+            .map_err(|error| anyhow::anyhow!("engine '{name}': invalid endpoint: {error}"))?;
+        // `query_pairs_mut` on a query-less URL adds a bare trailing `?`, so
+        // only touch the query string when there is something to append.
+        if !self.path_query || !self.extra_params.is_empty() {
             let mut pairs = url.query_pairs_mut();
-            pairs.append_pair(&self.query_param, query);
+            if !self.path_query {
+                pairs.append_pair(&self.query_param, query);
+            }
             for (key, value) in &self.extra_params {
                 pairs.append_pair(key, value);
             }
         }
-        url
+        Ok(url)
     }
 
     /// Extract `(title, url, snippet)` triples from the results HTML.
@@ -249,7 +268,10 @@ impl Engine for HtmlScrape {
         limit: usize,
         timeout: Duration,
     ) -> EngineResult<Vec<SearchResult>> {
-        let url = self.build_url(query);
+        // `from_config` already validated the substituted form, and the
+        // substituted region holds only unreserved characters, so this cannot
+        // fail at request time.
+        let url = self.try_build_url(query).map_err(|_| EngineError::Parse)?;
         debug!(engine = self.name(), %url, "requesting");
 
         let resp = self
@@ -295,6 +317,17 @@ mod tests {
             params,
         };
         HtmlScrape::from_config("bing", &cfg, "searxng-rs/test").expect("valid config")
+    }
+
+    fn scrape_config(params: &[(&str, &str)]) -> EngineConfig {
+        EngineConfig {
+            engine_type: "html_scrape".into(),
+            enabled: true,
+            params: params
+                .iter()
+                .map(|(k, v)| ((*k).into(), toml::Value::String((*v).into())))
+                .collect(),
+        }
     }
 
     const FIXTURE: &str = r#"
@@ -564,5 +597,253 @@ mod tests {
         assert!(decode_base64url("YQ==").is_some());
         assert!(decode_base64url("YQ").is_some());
         assert_eq!(decode_base64url("YWJj"), Some(b"abc".to_vec()));
+    }
+
+    #[test]
+    fn path_query_encodes_the_query_into_the_endpoint() {
+        for (endpoint, query, expected) in [
+            // Multi-word terms: a space becomes %20, not `+` or a segment.
+            (
+                "https://www.wordnik.com/words/{query}",
+                "rust async",
+                "https://www.wordnik.com/words/rust%20async",
+            ),
+            // An empty query yields an empty path segment, not a broken URL.
+            (
+                "https://www.wordnik.com/words/{query}",
+                "",
+                "https://www.wordnik.com/words/",
+            ),
+            // `/` cannot introduce a new path segment.
+            ("https://x.test/{query}", "a/b", "https://x.test/a%2Fb"),
+            // `?` and `#` cannot introduce a query string or a fragment.
+            (
+                "https://x.test/{query}",
+                "a?b#c",
+                "https://x.test/a%3Fb%23c",
+            ),
+            // Already-encoded input is escaped again, never double-decoded.
+            (
+                "https://x.test/{query}",
+                "100%20off",
+                "https://x.test/100%2520off",
+            ),
+            // `&` and `+` cannot forge a query parameter.
+            (
+                "https://x.test/{query}",
+                "a&b+c",
+                "https://x.test/a%26b%2Bc",
+            ),
+            // Non-ASCII becomes its UTF-8 percent-encoded bytes.
+            (
+                "https://x.test/{query}",
+                "caf\u{e9}",
+                "https://x.test/caf%C3%A9",
+            ),
+            // Every occurrence of the placeholder is substituted.
+            (
+                "https://x.test/{query}/{query}/1",
+                "q",
+                "https://x.test/q/q/1",
+            ),
+            // A pre-existing query string is preserved.
+            (
+                "https://wttr.in/{query}?format=j1",
+                "new york",
+                "https://wttr.in/new%20york?format=j1",
+            ),
+            // The upstream engines this unblocks.
+            (
+                "https://kickass.to/usearch/{query}/1/",
+                "rust lang",
+                "https://kickass.to/usearch/rust%20lang/1/",
+            ),
+            (
+                "https://stocksnap.io/api/search-photos/{query}/relevance/desc/1",
+                "blue sky",
+                "https://stocksnap.io/api/search-photos/blue%20sky/relevance/desc/1",
+            ),
+            (
+                "https://dictzone.com/en-fr-dictionary/{query}",
+                "a b",
+                "https://dictzone.com/en-fr-dictionary/a%20b",
+            ),
+            (
+                "https://x.test/rest/api/search/{query}",
+                "rust",
+                "https://x.test/rest/api/search/rust",
+            ),
+            (
+                "https://x.test/search/{query}/page/1",
+                "rust",
+                "https://x.test/search/rust/page/1",
+            ),
+        ] {
+            let e = HtmlScrape::from_config(
+                "api",
+                &scrape_config(&[
+                    ("endpoint", endpoint),
+                    ("path_query", "true"),
+                    ("result_selector", ".result"),
+                    ("link_selector", "a"),
+                ]),
+                "test/1",
+            )
+            .unwrap();
+            assert_eq!(
+                e.build_url(query).as_str(),
+                expected,
+                "{endpoint} + {query}"
+            );
+        }
+    }
+
+    #[test]
+    fn path_query_keeps_configured_extra_params() {
+        let e = HtmlScrape::from_config(
+            "api",
+            &scrape_config(&[
+                ("endpoint", "https://x.test/{query}"),
+                ("path_query", "true"),
+                ("param_cc", "tr"),
+                ("result_selector", ".result"),
+                ("link_selector", "a"),
+            ]),
+            "test/1",
+        )
+        .unwrap();
+        assert_eq!(
+            e.build_url("rust async").as_str(),
+            "https://x.test/rust%20async?cc=tr"
+        );
+        // Extra params append after any query string already in the endpoint.
+        let e = HtmlScrape::from_config(
+            "wttr",
+            &scrape_config(&[
+                ("endpoint", "https://wttr.in/{query}?format=j1"),
+                ("path_query", "true"),
+                ("param_cc", "tr"),
+                ("result_selector", ".result"),
+                ("link_selector", "a"),
+            ]),
+            "test/1",
+        )
+        .unwrap();
+        assert_eq!(
+            e.build_url("new york").as_str(),
+            "https://wttr.in/new%20york?format=j1&cc=tr"
+        );
+    }
+
+    #[test]
+    fn path_query_never_leaves_a_trailing_question_mark() {
+        let e = HtmlScrape::from_config(
+            "wordnik",
+            &scrape_config(&[
+                ("endpoint", "https://www.wordnik.com/words/{query}"),
+                ("path_query", "true"),
+                ("result_selector", ".result"),
+                ("link_selector", "a"),
+            ]),
+            "test/1",
+        )
+        .unwrap();
+        let url = e.build_url("rust");
+        assert_eq!(url.as_str(), "https://www.wordnik.com/words/rust");
+        assert_eq!(url.query(), None);
+    }
+
+    #[test]
+    fn path_query_defaults_to_query_string_behaviour() {
+        for path_query in [None, Some("false")] {
+            let mut params = vec![
+                ("endpoint", "https://x.test/search"),
+                ("result_selector", ".result"),
+                ("link_selector", "a"),
+            ];
+            if let Some(value) = path_query {
+                params.push(("path_query", value));
+            }
+            let e = HtmlScrape::from_config("api", &scrape_config(&params), "test/1").unwrap();
+            assert_eq!(
+                e.build_url("rust async").as_str(),
+                "https://x.test/search?q=rust+async",
+                "{params:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_inconsistent_path_query_configuration() {
+        for (params, expected) in [
+            // Enabled without a placeholder.
+            (
+                vec![
+                    ("endpoint", "https://example.test/search"),
+                    ("path_query", "true"),
+                ],
+                "no {query} placeholder",
+            ),
+            // A placeholder without the flag would ship as a literal.
+            (
+                vec![("endpoint", "https://example.test/{query}")],
+                "path_query is not enabled",
+            ),
+            (
+                vec![
+                    ("endpoint", "https://example.test/{query}"),
+                    ("path_query", "false"),
+                ],
+                "path_query is not enabled",
+            ),
+            // The substituted form is what must parse ...
+            (
+                vec![("endpoint", "{query}"), ("path_query", "true")],
+                "invalid endpoint",
+            ),
+            (
+                vec![("endpoint", "not a URL {query}"), ("path_query", "true")],
+                "invalid endpoint",
+            ),
+            // ... and what must carry an http(s) scheme.
+            (
+                vec![
+                    ("endpoint", "{query}://example.test/s"),
+                    ("path_query", "true"),
+                ],
+                "must use http or https",
+            ),
+        ] {
+            let mut full = params.clone();
+            full.push(("result_selector", ".result"));
+            full.push(("link_selector", "a"));
+            let error = HtmlScrape::from_config("api", &scrape_config(&full), "test/1")
+                .err()
+                .unwrap_or_else(|| panic!("{params:?} should be rejected"))
+                .to_string();
+            assert!(error.contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn path_query_urls_resolve_relative_hrefs() {
+        let e = HtmlScrape::from_config(
+            "wordnik",
+            &scrape_config(&[
+                ("endpoint", "https://www.wordnik.com/words/{query}"),
+                ("path_query", "true"),
+                ("result_selector", ".result"),
+                ("link_selector", "a"),
+            ]),
+            "test/1",
+        )
+        .unwrap();
+        let base = e.build_url("rust async");
+        let results = e.parse_html(
+            &base,
+            r#"<div class="result"><a href="/words/rust">Rust</a></div>"#,
+        );
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].1, "https://www.wordnik.com/words/rust");
     }
 }

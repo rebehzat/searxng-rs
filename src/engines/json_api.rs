@@ -22,6 +22,7 @@ pub struct JsonApi {
     name: String,
     client: reqwest::Client,
     endpoint: String,
+    path_query: bool,
     query_param: String,
     limit_param: Option<String>,
     results_path: Option<String>,
@@ -47,8 +48,8 @@ impl JsonApi {
         if endpoint.is_empty() {
             return Err(anyhow::anyhow!("engine '{name}' requires an endpoint"));
         }
-        let endpoint_url = Url::parse(&endpoint)
-            .map_err(|error| anyhow::anyhow!("engine '{name}': invalid endpoint: {error}"))?;
+        let path_query = cfg.bool_param("path_query", false);
+        let endpoint_url = super::validate_endpoint(name, &endpoint, path_query)?;
         if !matches!(endpoint_url.scheme(), "http" | "https") {
             return Err(anyhow::anyhow!(
                 "engine '{name}': endpoint must use http or https"
@@ -66,6 +67,7 @@ impl JsonApi {
             name: name.into(),
             client: reqwest::Client::builder().user_agent(user_agent).build()?,
             endpoint,
+            path_query,
             query_param: cfg.string_param("query_param", "q"),
             limit_param: (!limit_param.is_empty()).then_some(limit_param),
             results_path: (!cfg.string_param("results_path", "").is_empty())
@@ -249,7 +251,12 @@ impl JsonApi {
 
     fn request_params(&self, query: &str, limit: usize) -> Vec<(String, String)> {
         let limit = self.max_limit.map_or(limit, |max| limit.min(max));
-        let mut params = vec![(self.query_param.clone(), query.to_owned())];
+        let mut params = Vec::new();
+        // With `path_query` the term travels in the URL path, never as a
+        // query-string parameter.
+        if !self.path_query {
+            params.push((self.query_param.clone(), query.to_owned()));
+        }
         if let Some(limit_param) = &self.limit_param {
             params.push((limit_param.clone(), limit.to_string()));
         }
@@ -271,11 +278,12 @@ impl Engine for JsonApi {
     ) -> EngineResult<Vec<SearchResult>> {
         let params = self.request_params(query, limit);
         let limit = self.max_limit.map_or(limit, |max| limit.min(max));
-        let mut request = self
-            .client
-            .get(&self.endpoint)
-            .query(&params)
-            .timeout(timeout);
+        // `from_config` already validated the substituted form, and the
+        // substituted region holds only unreserved characters, so this cannot
+        // fail at request time.
+        let endpoint = super::resolve_endpoint(&self.endpoint, self.path_query, query)
+            .map_err(|_| EngineError::Parse)?;
+        let mut request = self.client.get(endpoint).query(&params).timeout(timeout);
         if let Some((header, value)) = &self.api_key {
             request = request.header(header, value);
         }
@@ -436,6 +444,7 @@ fn truncate_text(text: String, max_length: Option<usize>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engines::resolve_endpoint;
 
     fn config(params: &[(&str, &str)]) -> EngineConfig {
         EngineConfig {
@@ -1094,5 +1103,237 @@ max_limit = 40
             Err(EngineError::Parse)
         ));
         server.await.unwrap();
+    }
+
+    #[test]
+    fn path_query_encodes_the_query_into_the_endpoint() {
+        for (endpoint, query, expected) in [
+            // Multi-word terms: a space becomes %20, not `+` or a segment.
+            (
+                "https://www.wordnik.com/words/{query}",
+                "rust async",
+                "https://www.wordnik.com/words/rust%20async",
+            ),
+            // An empty query yields an empty path segment, not a broken URL.
+            (
+                "https://www.wordnik.com/words/{query}",
+                "",
+                "https://www.wordnik.com/words/",
+            ),
+            // `/` cannot introduce a new path segment.
+            ("https://x.test/{query}", "a/b", "https://x.test/a%2Fb"),
+            // `?` and `#` cannot introduce a query string or a fragment.
+            (
+                "https://x.test/{query}",
+                "a?b#c",
+                "https://x.test/a%3Fb%23c",
+            ),
+            // Already-encoded input is escaped again, never double-decoded.
+            (
+                "https://x.test/{query}",
+                "100%20off",
+                "https://x.test/100%2520off",
+            ),
+            // `&` and `+` cannot forge a query parameter.
+            (
+                "https://x.test/{query}",
+                "a&b+c",
+                "https://x.test/a%26b%2Bc",
+            ),
+            // Non-ASCII becomes its UTF-8 percent-encoded bytes.
+            (
+                "https://x.test/{query}",
+                "caf\u{e9}",
+                "https://x.test/caf%C3%A9",
+            ),
+            // Every occurrence of the placeholder is substituted.
+            (
+                "https://x.test/{query}/{query}/1",
+                "q",
+                "https://x.test/q/q/1",
+            ),
+            // A pre-existing query string is preserved.
+            (
+                "https://wttr.in/{query}?format=j1",
+                "new york",
+                "https://wttr.in/new%20york?format=j1",
+            ),
+            // The upstream engines this unblocks.
+            (
+                "https://kickass.to/usearch/{query}/1/",
+                "rust lang",
+                "https://kickass.to/usearch/rust%20lang/1/",
+            ),
+            (
+                "https://stocksnap.io/api/search-photos/{query}/relevance/desc/1",
+                "blue sky",
+                "https://stocksnap.io/api/search-photos/blue%20sky/relevance/desc/1",
+            ),
+            (
+                "https://dictzone.com/en-fr-dictionary/{query}",
+                "a b",
+                "https://dictzone.com/en-fr-dictionary/a%20b",
+            ),
+            (
+                "https://x.test/rest/api/search/{query}",
+                "rust",
+                "https://x.test/rest/api/search/rust",
+            ),
+            (
+                "https://x.test/search/{query}/page/1",
+                "rust",
+                "https://x.test/search/rust/page/1",
+            ),
+        ] {
+            let url = resolve_endpoint(endpoint, true, query).unwrap();
+            assert_eq!(url.as_str(), expected, "{endpoint} + {query}");
+            let e = JsonApi::from_config(
+                "api",
+                &config(&[("endpoint", endpoint), ("path_query", "true")]),
+                "test/1",
+            )
+            .unwrap();
+            assert!(e.path_query, "{endpoint}");
+            let url = resolve_endpoint(&e.endpoint, e.path_query, query).unwrap();
+            assert_eq!(url.as_str(), expected, "from_config wiring: {endpoint}");
+            // The term never also travels as a query-string parameter.
+            assert!(e.request_params(query, 5).is_empty(), "{endpoint}");
+        }
+    }
+
+    #[test]
+    fn path_query_keeps_the_limit_parameter() {
+        let e = JsonApi::from_config(
+            "api",
+            &config(&[
+                ("endpoint", "https://x.test/{query}"),
+                ("path_query", "true"),
+                ("limit_param", "n"),
+                ("max_limit", "40"),
+            ]),
+            "test/1",
+        )
+        .unwrap();
+        assert_eq!(
+            e.request_params("q", 50),
+            vec![("n".to_string(), "40".to_string())]
+        );
+    }
+
+    #[test]
+    fn path_query_defaults_to_query_string_behaviour() {
+        for params in [
+            vec![("endpoint", "https://example.test/search")],
+            vec![
+                ("endpoint", "https://example.test/search"),
+                ("path_query", "false"),
+            ],
+        ] {
+            let e = JsonApi::from_config("api", &config(&params), "test/1").unwrap();
+            assert!(!e.path_query, "{params:?}");
+            let url = resolve_endpoint(&e.endpoint, e.path_query, "a b").unwrap();
+            assert_eq!(url.as_str(), "https://example.test/search");
+            assert_eq!(
+                e.request_params("a b", 5),
+                vec![("q".to_string(), "a b".to_string())]
+            );
+        }
+        // The option is also readable as a native TOML boolean.
+        let config = crate::config::Config::from_toml_str(
+            r#"
+[engines.api]
+type = "json_api"
+endpoint = "https://example.test/words/{query}"
+path_query = true
+"#,
+        )
+        .unwrap();
+        let e = JsonApi::from_config("api", &config.engines["api"], "test/1").unwrap();
+        assert!(e.path_query);
+    }
+
+    #[test]
+    fn rejects_inconsistent_path_query_configuration() {
+        for (params, expected) in [
+            // Enabled without a placeholder.
+            (
+                vec![
+                    ("endpoint", "https://example.test/search"),
+                    ("path_query", "true"),
+                ],
+                "no {query} placeholder",
+            ),
+            // A placeholder without the flag would ship as a literal.
+            (
+                vec![("endpoint", "https://example.test/{query}")],
+                "path_query is not enabled",
+            ),
+            (
+                vec![
+                    ("endpoint", "https://example.test/{query}"),
+                    ("path_query", "false"),
+                ],
+                "path_query is not enabled",
+            ),
+            // The substituted form is what must parse ...
+            (
+                vec![("endpoint", "{query}"), ("path_query", "true")],
+                "invalid endpoint",
+            ),
+            (
+                vec![("endpoint", "not a URL {query}"), ("path_query", "true")],
+                "invalid endpoint",
+            ),
+            // ... and what must carry an http(s) scheme.
+            (
+                vec![
+                    ("endpoint", "{query}://example.test/s"),
+                    ("path_query", "true"),
+                ],
+                "must use http or https",
+            ),
+        ] {
+            let error = JsonApi::from_config("api", &config(&params), "test/1")
+                .err()
+                .unwrap_or_else(|| panic!("{params:?} should be rejected"))
+                .to_string();
+            assert!(error.contains(expected), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn path_query_sends_the_term_in_the_path() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/words/{{query}}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            let read = stream.read(&mut request).await.unwrap();
+            let request = String::from_utf8_lossy(&request[..read]);
+            let line = request.lines().next().unwrap_or_default();
+            let body = r#"{"results":[]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            line.to_owned()
+        });
+        let e = JsonApi::from_config(
+            "api",
+            &config(&[("endpoint", &endpoint), ("path_query", "true")]),
+            "test/1",
+        )
+        .unwrap();
+        let results = e
+            .search("rust async", 5, std::time::Duration::from_secs(1))
+            .await
+            .expect("provider responded");
+        assert!(results.is_empty());
+        // The term is in the path only: no `?q=` and no trailing `?`.
+        assert_eq!(server.await.unwrap(), "GET /words/rust%20async HTTP/1.1");
     }
 }
