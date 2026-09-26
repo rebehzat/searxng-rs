@@ -5,8 +5,8 @@
 //! This adapter performs ordinary public or API-key-authenticated requests;
 //! it never circumvents provider controls.
 
-use std::collections::HashMap;
-use std::time::Duration;
+use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use reqwest::Url;
@@ -34,6 +34,8 @@ pub struct JsonApi {
     fallback_url_field: Option<String>,
     fallback_url_template: Option<String>,
     max_limit: Option<usize>,
+    /// Optional multi-page configuration; [`super::Paging::none`] by default.
+    paging: super::Paging,
     snippet_field: String,
     array_value_field: Option<String>,
     normalize_title_html: bool,
@@ -49,12 +51,28 @@ impl JsonApi {
             return Err(anyhow::anyhow!("engine '{name}' requires an endpoint"));
         }
         let path_query = cfg.bool_param("path_query", false);
-        let endpoint_url = super::validate_endpoint(name, &endpoint, path_query)?;
+        let query_param = cfg.string_param("query_param", "q");
+        let limit_param = cfg.string_param("limit_param", "").trim().to_owned();
+        let page_param = cfg.string_param("page_param", "").trim().to_owned();
+        let page_in_path = cfg.bool_param("page_in_path", false);
+        let paging = super::paging_from_config(
+            name,
+            cfg,
+            (!page_param.is_empty()).then_some(page_param),
+            page_in_path,
+            &[query_param.as_str(), limit_param.as_str()],
+        )?;
+        let endpoint_url =
+            super::validate_endpoint(name, &endpoint, path_query, paging.first_page())?;
         if !matches!(endpoint_url.scheme(), "http" | "https") {
             return Err(anyhow::anyhow!(
                 "engine '{name}': endpoint must use http or https"
             ));
         }
+        // Both reqwest's `query()` and any hand-rolled append_pair() add to
+        // the endpoint's query string, so a key the endpoint already pins
+        // would ship twice and the loop would never leave page 1.
+        super::reject_pinned_page_param(name, &endpoint_url, &paging)?;
         let api_key = match cfg.params.get("api_key_env") {
             Some(toml::Value::String(env_name)) if !env_name.is_empty() => std::env::var(env_name)
                 .ok()
@@ -62,13 +80,12 @@ impl JsonApi {
                 .map(|value| (cfg.string_param("api_key_header", "Authorization"), value)),
             _ => None,
         };
-        let limit_param = cfg.string_param("limit_param", "").trim().to_owned();
         Ok(Self {
             name: name.into(),
             client: reqwest::Client::builder().user_agent(user_agent).build()?,
             endpoint,
             path_query,
-            query_param: cfg.string_param("query_param", "q"),
+            query_param,
             limit_param: (!limit_param.is_empty()).then_some(limit_param),
             results_path: (!cfg.string_param("results_path", "").is_empty())
                 .then(|| cfg.string_param("results_path", "")),
@@ -84,6 +101,7 @@ impl JsonApi {
             fallback_url_template: (!cfg.string_param("fallback_url_template", "").is_empty())
                 .then(|| cfg.string_param("fallback_url_template", "")),
             max_limit: cfg.usize_param("max_limit", None),
+            paging,
             snippet_field: cfg.string_param("snippet_field", "snippet"),
             array_value_field: (!cfg.string_param("array_value_field", "").is_empty())
                 .then(|| cfg.string_param("array_value_field", "")),
@@ -249,8 +267,49 @@ impl JsonApi {
         self.build_result_url(item, &fallback, false)
     }
 
-    fn request_params(&self, query: &str, limit: usize) -> Vec<(String, String)> {
-        let limit = self.max_limit.map_or(limit, |max| limit.min(max));
+    /// Number of items a single page may hold: what this engine asks the
+    /// provider for and what it parses out of one response.
+    ///
+    /// `max_limit` caps the *page size*, never the search total. Conflating the
+    /// two is what would make paging dead for every `max_limit` engine: the
+    /// running total would be compared against the clamped page size, the load
+    /// guardrail would trip on page 1 and a second request would never be
+    /// issued.
+    fn page_size(&self, limit: usize) -> usize {
+        self.max_limit.map_or(limit, |max| limit.min(max))
+    }
+
+    /// Fetch and decode one page. `page_size` is the provider-capped number of
+    /// items requested and parsed for this page; `budget` is the caller's
+    /// *remaining* whole-search budget, not a fresh per-request timeout.
+    async fn fetch_page(
+        &self,
+        query: &str,
+        page_size: usize,
+        page: Option<usize>,
+        budget: Duration,
+    ) -> EngineResult<Value> {
+        let params = self.request_params(query, page_size, page);
+        // `from_config` already validated the substituted form, and the
+        // substituted region holds only unreserved characters, so this cannot
+        // fail at request time.
+        let endpoint = super::resolve_endpoint(&self.endpoint, self.path_query, query, page)
+            .map_err(|_| EngineError::Parse)?;
+        let mut request = self.client.get(endpoint).query(&params).timeout(budget);
+        if let Some((header, value)) = &self.api_key {
+            request = request.header(header, value);
+        }
+        let body = request.send().await?.error_for_status()?.text().await?;
+        serde_json::from_str(&body).map_err(|_| EngineError::Parse)
+    }
+
+    fn request_params(
+        &self,
+        query: &str,
+        limit: usize,
+        page: Option<usize>,
+    ) -> Vec<(String, String)> {
+        let limit = self.page_size(limit);
         let mut params = Vec::new();
         // With `path_query` the term travels in the URL path, never as a
         // query-string parameter.
@@ -259,6 +318,11 @@ impl JsonApi {
         }
         if let Some(limit_param) = &self.limit_param {
             params.push((limit_param.clone(), limit.to_string()));
+        }
+        // The page value goes last, so a provider that ignores unknown keys
+        // still sees the documented `?q=..&size=..&first=..` order.
+        if let (Some(page_param), Some(page)) = (&self.paging.param, page) {
+            params.push((page_param.clone(), page.to_string()));
         }
         params
     }
@@ -276,20 +340,82 @@ impl Engine for JsonApi {
         limit: usize,
         timeout: Duration,
     ) -> EngineResult<Vec<SearchResult>> {
-        let params = self.request_params(query, limit);
-        let limit = self.max_limit.map_or(limit, |max| limit.min(max));
-        // `from_config` already validated the substituted form, and the
-        // substituted region holds only unreserved characters, so this cannot
-        // fail at request time.
-        let endpoint = super::resolve_endpoint(&self.endpoint, self.path_query, query)
-            .map_err(|_| EngineError::Parse)?;
-        let mut request = self.client.get(endpoint).query(&params).timeout(timeout);
-        if let Some((header, value)) = &self.api_key {
-            request = request.header(header, value);
+        // `Engine::search` documents that `timeout` bounds the whole request +
+        // parse, so a multi-page loop shares this one deadline instead of
+        // multiplying the caller's budget.
+        let deadline = Instant::now() + timeout;
+        // `max_limit` clamps the per-request page size exactly as it always
+        // did. The loop's target stays the caller's `limit`: the running total
+        // is compared against it and the combined list is truncated to it, so
+        // a paged engine can accumulate up to the caller's `limit` even when
+        // every individual page is capped well below it.
+        let page_size = self.page_size(limit);
+        let mut collected: Vec<SearchResult> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+
+        // `max_pages()` is 1 when paging is off, so this loop is exactly the
+        // pre-change single request for every existing configuration.
+        for page_number in 1..=self.paging.max_pages() {
+            let first = page_number == 1;
+            // Load guardrail: never fetch another page once the running total
+            // already satisfies `limit`. Page 1 is exempt because a single
+            // request was always made, even for `limit = 0`.
+            if page_number > 1 && collected.len() >= limit {
+                break;
+            }
+            // `None` when paging is off: no page value, no substitution.
+            let page = self.paging.page_for(page_number);
+            // Deadline: this page gets only what is left of the caller's
+            // budget, and a page that cannot finish is never started.
+            let Some(budget) = super::request_budget(deadline, first) else {
+                break;
+            };
+
+            let value = match self.fetch_page(query, page_size, page, budget).await {
+                Ok(value) => value,
+                // The first page stays strict, so with paging off this is the
+                // pre-change error taxonomy.
+                Err(error) if first => return Err(error),
+                // A later page that fails ends the loop: the caller keeps what
+                // earlier pages produced.
+                Err(_) => break,
+            };
+
+            // Page 1 keeps the strict check that turns an error-shaped payload
+            // into `EngineError::Parse`. A later page that lost its result
+            // array ends the loop instead of failing the search.
+            let page_results = if first {
+                self.parse_value_checked(value, page_size)?
+            } else if self.has_result_array(&value) {
+                // Parsed at the full page size, never at the remaining need:
+                // `parse_value` applies `take(limit)` before dropping unusable
+                // entries, so a small remainder could turn a healthy page into
+                // a false "empty page". Truncation happens once, at the end.
+                self.parse_value(value, page_size)
+            } else {
+                Vec::new()
+            };
+
+            // Deduplicate across pages, first occurrence wins. Page 1 is kept
+            // exactly as the single-request code path produced it - duplicates
+            // included - so default-off output is unchanged; the set is still
+            // seeded with its URLs so a later page cannot repeat them.
+            let before = collected.len();
+            for result in page_results {
+                let fresh = seen.insert(super::dedupe_url_key(&result.url).to_owned());
+                if fresh || first {
+                    collected.push(result);
+                }
+            }
+            // A page that adds nothing - empty, or a provider that repeats the
+            // last page when exhausted (Bing) - ends the loop.
+            if collected.len() == before {
+                break;
+            }
         }
-        let body = request.send().await?.error_for_status()?.text().await?;
-        let value: Value = serde_json::from_str(&body).map_err(|_| EngineError::Parse)?;
-        self.parse_value_checked(value, limit)
+        // A multi-page fetch can never over-return.
+        collected.truncate(limit);
+        Ok(collected)
     }
 }
 
@@ -879,7 +1005,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            e.request_params("rust async", 7),
+            e.request_params("rust async", 7, None),
             vec![
                 ("search".to_string(), "rust async".to_string()),
                 ("limit".to_string(), "7".to_string()),
@@ -901,7 +1027,7 @@ mod tests {
         .unwrap();
         assert_eq!(e.max_limit, Some(40));
         assert_eq!(
-            e.request_params("rust", 50),
+            e.request_params("rust", 50, None),
             vec![
                 ("q".to_string(), "rust".to_string()),
                 ("per_page".to_string(), "40".to_string()),
@@ -1185,7 +1311,7 @@ max_limit = 40
                 "https://x.test/search/rust/page/1",
             ),
         ] {
-            let url = resolve_endpoint(endpoint, true, query).unwrap();
+            let url = resolve_endpoint(endpoint, true, query, None).unwrap();
             assert_eq!(url.as_str(), expected, "{endpoint} + {query}");
             let e = JsonApi::from_config(
                 "api",
@@ -1194,10 +1320,10 @@ max_limit = 40
             )
             .unwrap();
             assert!(e.path_query, "{endpoint}");
-            let url = resolve_endpoint(&e.endpoint, e.path_query, query).unwrap();
+            let url = resolve_endpoint(&e.endpoint, e.path_query, query, None).unwrap();
             assert_eq!(url.as_str(), expected, "from_config wiring: {endpoint}");
             // The term never also travels as a query-string parameter.
-            assert!(e.request_params(query, 5).is_empty(), "{endpoint}");
+            assert!(e.request_params(query, 5, None).is_empty(), "{endpoint}");
         }
     }
 
@@ -1215,7 +1341,7 @@ max_limit = 40
         )
         .unwrap();
         assert_eq!(
-            e.request_params("q", 50),
+            e.request_params("q", 50, None),
             vec![("n".to_string(), "40".to_string())]
         );
     }
@@ -1231,10 +1357,10 @@ max_limit = 40
         ] {
             let e = JsonApi::from_config("api", &config(&params), "test/1").unwrap();
             assert!(!e.path_query, "{params:?}");
-            let url = resolve_endpoint(&e.endpoint, e.path_query, "a b").unwrap();
+            let url = resolve_endpoint(&e.endpoint, e.path_query, "a b", None).unwrap();
             assert_eq!(url.as_str(), "https://example.test/search");
             assert_eq!(
-                e.request_params("a b", 5),
+                e.request_params("a b", 5, None),
                 vec![("q".to_string(), "a b".to_string())]
             );
         }
@@ -1335,5 +1461,1349 @@ path_query = true
         assert!(results.is_empty());
         // The term is in the path only: no `?q=` and no trailing `?`.
         assert_eq!(server.await.unwrap(), "GET /words/rust%20async HTTP/1.1");
+    }
+
+    // --- multi-page (paging) support -------------------------------------
+
+    /// One canned HTTP response for the recording test server.
+    struct Page {
+        delay: Duration,
+        status: u16,
+        body: String,
+    }
+
+    impl Page {
+        fn ok(body: impl Into<String>) -> Self {
+            Self {
+                delay: Duration::ZERO,
+                status: 200,
+                body: body.into(),
+            }
+        }
+        fn slow(body: impl Into<String>, delay: Duration) -> Self {
+            Self {
+                delay,
+                status: 200,
+                body: body.into(),
+            }
+        }
+        fn status(status: u16) -> Self {
+            Self {
+                delay: Duration::ZERO,
+                status,
+                body: String::new(),
+            }
+        }
+    }
+
+    /// Serve `pages` in order, one per connection, recording every request
+    /// line.
+    ///
+    /// The task keeps accepting until the test aborts it, so a test that issues
+    /// fewer requests than it queued can still read the recorded lines. A
+    /// request past the end of the script is answered with a distinctive `503`
+    /// and an empty body, which surfaces as a parse error rather than silently
+    /// passing, and `Connection: close` keeps every request on its own
+    /// connection so the client cannot reorder them through its pool.
+    async fn recording_server(
+        pages: Vec<Page>,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = format!("http://{}", listener.local_addr().unwrap());
+        let recorded = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = std::sync::Arc::clone(&recorded);
+        let mut queue = std::collections::VecDeque::from(pages);
+        let task = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let page = queue.pop_front().unwrap_or(Page {
+                    delay: Duration::ZERO,
+                    status: 503,
+                    body: "server-exhausted".into(),
+                });
+                let sink = std::sync::Arc::clone(&sink);
+                tokio::spawn(async move {
+                    let mut buffer = [0u8; 8192];
+                    let read = stream.read(&mut buffer).await.unwrap_or(0);
+                    sink.lock().unwrap().push(
+                        String::from_utf8_lossy(&buffer[..read])
+                            .lines()
+                            .next()
+                            .unwrap_or_default()
+                            .to_owned(),
+                    );
+                    if !page.delay.is_zero() {
+                        tokio::time::sleep(page.delay).await;
+                    }
+                    let reason = if page.status == 200 { "OK" } else { "Error" };
+                    let response = format!(
+                        "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        page.status,
+                        reason,
+                        page.body.len(),
+                        page.body
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        (addr, recorded, task)
+    }
+
+    /// Stop the test server and return every request line it saw, in order.
+    async fn request_lines(
+        task: tokio::task::JoinHandle<()>,
+        recorded: &std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> Vec<String> {
+        task.abort();
+        recorded.lock().unwrap().clone()
+    }
+
+    /// `count` distinct results, titled `T<first>..`, at `/<first>..`.
+    fn json_page(count: usize, first: usize) -> String {
+        let items = (first..first + count)
+            .map(|index| format!(r#"{{"title":"T{index}","url":"https://example.test/{index}"}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(r#"{{"results":[{items}]}}"#)
+    }
+
+    /// Three usable results, but only after two entries that cannot be used.
+    fn json_mixed_page(first: usize) -> String {
+        let mut items = vec![
+            r#"{"title":"  ","url":"https://example.test/blank"}"#.to_owned(),
+            r#"{"title":"Unsafe","url":"javascript:alert(1)"}"#.to_owned(),
+        ];
+        items.extend((first..first + 3).map(|index| {
+            format!(r#"{{"title":"T{index}","url":"https://example.test/{index}"}}"#)
+        }));
+        format!(r#"{{"results":[{}]}}"#, items.join(","))
+    }
+
+    /// `max_limit` items, in the shape `docker_hub` returns: a full page.
+    fn docker_page(count: usize, first: usize) -> String {
+        let items = (first..first + count)
+            .map(|index| {
+                format!(
+                    r#"{{"name":"image{index}","slug":"image{index}","short_description":"d{index}"}}"#
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(r#"{{"results":[{items}]}}"#)
+    }
+
+    #[tokio::test]
+    async fn no_paging_keys_issue_exactly_one_request_with_an_identical_url() {
+        // `max_pages` on its own, with no `page_param`, must stay inert.
+        let (addr, recorded, task) = recording_server(vec![
+            Page::ok(json_page(5, 1)),
+            Page::ok(json_page(5, 6)),
+            Page::ok(json_page(5, 11)),
+        ])
+        .await;
+        let endpoint = format!("{addr}/search");
+        let e = JsonApi::from_config(
+            "api",
+            &config(&[
+                ("endpoint", &endpoint),
+                ("limit_param", "size"),
+                ("max_pages", "3"),
+            ]),
+            "test/1",
+        )
+        .unwrap();
+        let results = e
+            .search("rust async", 5, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(
+            request_lines(task, &recorded).await,
+            vec!["GET /search?q=rust+async&size=5 HTTP/1.1".to_owned()]
+        );
+        // The page-1 list, unchanged and in order.
+        assert_eq!(
+            results.iter().map(|r| r.title.as_str()).collect::<Vec<_>>(),
+            ["T1", "T2", "T3", "T4", "T5"]
+        );
+    }
+
+    #[test]
+    fn paging_defaults_are_off_and_single_page() {
+        let e = JsonApi::from_config(
+            "api",
+            &config(&[("endpoint", "https://example.test/search")]),
+            "test/1",
+        )
+        .unwrap();
+        assert_eq!(e.paging.max_pages(), 1);
+        assert_eq!(e.paging.page_for(1), None);
+        assert_eq!(e.paging.page_for(7), None);
+        assert_eq!(e.paging.first_page(), None);
+        assert_eq!(e.paging.param(), None);
+        // No page value is ever requested or sent.
+        assert_eq!(
+            resolve_endpoint("https://example.test/search", false, "q", None)
+                .unwrap()
+                .as_str(),
+            "https://example.test/search"
+        );
+        assert_eq!(
+            e.request_params("q", 5, e.paging.page_for(1)),
+            vec![("q".to_string(), "q".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn first_page_satisfying_limit_issues_one_request() {
+        for (limit, expected) in [(5, 5), (4, 4)] {
+            let (addr, recorded, task) =
+                recording_server(vec![Page::ok(json_page(5, 1)), Page::ok(json_page(5, 6))]).await;
+            let endpoint = format!("{addr}/search");
+            let e = JsonApi::from_config(
+                "api",
+                &config(&[
+                    ("endpoint", &endpoint),
+                    ("page_param", "first"),
+                    ("max_pages", "3"),
+                ]),
+                "test/1",
+            )
+            .unwrap();
+            let results = e
+                .search("rust", limit, Duration::from_secs(5))
+                .await
+                .unwrap();
+            let lines = request_lines(task, &recorded).await;
+            assert_eq!(lines.len(), 1, "limit {limit}: {lines:?}");
+            assert_eq!(lines[0], "GET /search?q=rust&first=1 HTTP/1.1");
+            assert_eq!(results.len(), expected, "limit {limit}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_second_page_is_requested_only_while_the_total_is_below_limit() {
+        let (addr, recorded, task) = recording_server(vec![
+            Page::ok(json_page(3, 1)),
+            Page::ok(json_page(3, 4)),
+            Page::ok(json_page(3, 7)),
+        ])
+        .await;
+        let endpoint = format!("{addr}/search");
+        let e = JsonApi::from_config(
+            "api",
+            &config(&[
+                ("endpoint", &endpoint),
+                ("page_param", "page"),
+                ("max_pages", "3"),
+            ]),
+            "test/1",
+        )
+        .unwrap();
+        let results = e.search("rust", 5, Duration::from_secs(5)).await.unwrap();
+        let lines = request_lines(task, &recorded).await;
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert_eq!(lines[1], "GET /search?q=rust&page=2 HTTP/1.1");
+        assert_eq!(results.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn a_page_that_parses_to_zero_results_stops_the_loop() {
+        let (addr, recorded, task) = recording_server(vec![
+            Page::ok(json_mixed_page(1)),
+            // An empty result array, and a page whose entries are all unusable:
+            // either must end the loop instead of burning the page budget.
+            Page::ok(r#"{"results":[]}"#),
+            Page::ok(json_page(3, 7)),
+        ])
+        .await;
+        let endpoint = format!("{addr}/search");
+        let e = JsonApi::from_config(
+            "api",
+            &config(&[
+                ("endpoint", &endpoint),
+                ("page_param", "page"),
+                ("max_pages", "3"),
+            ]),
+            "test/1",
+        )
+        .unwrap();
+        let results = e.search("rust", 100, Duration::from_secs(5)).await.unwrap();
+        assert_eq!(request_lines(task, &recorded).await.len(), 2);
+        assert_eq!(results.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_later_page_is_parsed_at_the_page_size_not_the_remaining_need() {
+        let (addr, recorded, task) = recording_server(vec![
+            Page::ok(json_mixed_page(1)),
+            // The two unusable entries come first here: parsing this page at
+            // the remaining need (2) would take them, drop them, and report a
+            // healthy page as empty.
+            Page::ok(json_mixed_page(4)),
+        ])
+        .await;
+        let endpoint = format!("{addr}/search");
+        let e = JsonApi::from_config(
+            "api",
+            &config(&[
+                ("endpoint", &endpoint),
+                ("page_param", "page"),
+                ("max_pages", "3"),
+            ]),
+            "test/1",
+        )
+        .unwrap();
+        let results = e.search("rust", 5, Duration::from_secs(5)).await.unwrap();
+        assert_eq!(request_lines(task, &recorded).await.len(), 2);
+        assert_eq!(
+            results.iter().map(|r| r.title.as_str()).collect::<Vec<_>>(),
+            ["T1", "T2", "T3", "T4", "T5"]
+        );
+    }
+
+    #[tokio::test]
+    async fn max_pages_caps_the_number_of_requests() {
+        let (addr, recorded, task) = recording_server(vec![
+            Page::ok(json_page(1, 1)),
+            Page::ok(json_page(1, 2)),
+            Page::ok(json_page(1, 3)),
+            // A fourth page is queued and must never be requested.
+            Page::ok(json_page(1, 4)),
+        ])
+        .await;
+        let endpoint = format!("{addr}/search");
+        let e = JsonApi::from_config(
+            "api",
+            &config(&[
+                ("endpoint", &endpoint),
+                ("page_param", "page"),
+                ("max_pages", "3"),
+            ]),
+            "test/1",
+        )
+        .unwrap();
+        let results = e.search("rust", 100, Duration::from_secs(5)).await.unwrap();
+        let lines = request_lines(task, &recorded).await;
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert_eq!(results.len(), 3);
+    }
+
+    #[test]
+    fn max_pages_above_the_hard_ceiling_is_rejected() {
+        for (value, expected) in [
+            ("11", "max_pages must be between 1 and 10, got 11"),
+            ("0", "max_pages must be between 1 and 10, got 0"),
+        ] {
+            let error = JsonApi::from_config(
+                "api",
+                &config(&[
+                    ("endpoint", "https://example.test/search"),
+                    ("page_param", "page"),
+                    ("max_pages", value),
+                ]),
+                "test/1",
+            )
+            .err()
+            .unwrap_or_else(|| panic!("max_pages = {value} should be rejected"))
+            .to_string();
+            assert!(error.contains(expected), "{error}");
+            // The key is rejected even when paging is off, so it is never
+            // silently inert.
+            let error = JsonApi::from_config(
+                "api",
+                &config(&[
+                    ("endpoint", "https://example.test/search"),
+                    ("max_pages", value),
+                ]),
+                "test/1",
+            )
+            .err()
+            .unwrap_or_else(|| panic!("max_pages = {value} should be rejected when paging is off"))
+            .to_string();
+            assert!(error.contains(expected), "{error}");
+        }
+        // The ceiling itself is accepted ...
+        let e = JsonApi::from_config(
+            "api",
+            &config(&[
+                ("endpoint", "https://example.test/search"),
+                ("page_param", "page"),
+                ("max_pages", "10"),
+            ]),
+            "test/1",
+        )
+        .unwrap();
+        assert_eq!(e.paging.max_pages(), 10);
+        // ... and an unreadable value falls back to the documented default
+        // instead of failing the engine, exactly like `max_limit`.
+        let e = JsonApi::from_config(
+            "api",
+            &config(&[
+                ("endpoint", "https://example.test/search"),
+                ("page_param", "page"),
+                ("max_pages", "-1"),
+            ]),
+            "test/1",
+        )
+        .unwrap();
+        assert_eq!(e.paging.max_pages(), 3);
+    }
+
+    #[tokio::test]
+    async fn page_start_and_page_step_drive_the_page_parameter() {
+        for (param, start, step, expected) in [
+            // bing_images: ?q=..&first=1, first = 1 + (n-1)*35
+            ("first", "1", "35", ["first=1", "first=36", "first=71"]),
+            // docker_hub: ?from=<n*10>
+            ("from", "0", "10", ["from=0", "from=10", "from=20"]),
+            // chefkoch: ?offset=<n*20>
+            ("offset", "0", "20", ["offset=0", "offset=20", "offset=40"]),
+            ("offset", "0", "40", ["offset=0", "offset=40", "offset=80"]),
+            // pexels, solidtorrents: ?page=<n>
+            ("page", "1", "1", ["page=1", "page=2", "page=3"]),
+            // wikicommons: ?gsroffset=<n*10>
+            (
+                "gsroffset",
+                "0",
+                "10",
+                ["gsroffset=0", "gsroffset=10", "gsroffset=20"],
+            ),
+        ] {
+            let (addr, recorded, task) = recording_server(vec![
+                Page::ok(json_page(1, 1)),
+                Page::ok(json_page(1, 2)),
+                Page::ok(json_page(1, 3)),
+            ])
+            .await;
+            let endpoint = format!("{addr}/search");
+            let e = JsonApi::from_config(
+                "api",
+                &config(&[
+                    ("endpoint", &endpoint),
+                    ("page_param", param),
+                    ("page_start", start),
+                    ("page_step", step),
+                    ("max_pages", "3"),
+                ]),
+                "test/1",
+            )
+            .unwrap();
+            let results = e.search("rust", 100, Duration::from_secs(5)).await.unwrap();
+            let lines = request_lines(task, &recorded).await;
+            assert_eq!(lines.len(), 3, "{param} {start} {step}: {lines:?}");
+            for (line, want) in lines.iter().zip(expected) {
+                assert!(line.contains(want), "{line} should carry {want}");
+                assert_eq!(
+                    line.matches(want).count(),
+                    1,
+                    "{line} should carry {want} exactly once"
+                );
+            }
+            assert_eq!(results.len(), 3, "{param}");
+        }
+    }
+
+    #[tokio::test]
+    async fn deadline_exhaustion_stops_the_loop_and_returns_partial_results() {
+        let (addr, recorded, task) = recording_server(vec![
+            Page::slow(json_page(2, 1), Duration::from_millis(400)),
+            Page::ok(json_page(2, 3)),
+        ])
+        .await;
+        let endpoint = format!("{addr}/search");
+        let e = JsonApi::from_config(
+            "api",
+            &config(&[
+                ("endpoint", &endpoint),
+                ("page_param", "offset"),
+                ("max_pages", "3"),
+            ]),
+            "test/1",
+        )
+        .unwrap();
+        // 600 ms of budget, 400 ms spent on page 1: 200 ms is left, below the
+        // 500 ms floor, so page 2 is never started.
+        let results = e
+            .search("rust", 10, Duration::from_millis(600))
+            .await
+            .expect("page 1 results are still returned");
+        let lines = request_lines(task, &recorded).await;
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(results.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_sub_floor_timeout_still_issues_exactly_one_request() {
+        let (addr, recorded, task) = recording_server(vec![
+            Page::ok(json_page(1, 1)),
+            Page::ok(json_page(1, 2)),
+            Page::ok(json_page(1, 3)),
+        ])
+        .await;
+        let endpoint = format!("{addr}/search");
+        let e = JsonApi::from_config(
+            "api",
+            &config(&[
+                ("endpoint", &endpoint),
+                ("page_param", "page"),
+                ("max_pages", "3"),
+            ]),
+            "test/1",
+        )
+        .unwrap();
+        let results = e
+            .search("rust", 100, Duration::from_millis(200))
+            .await
+            .unwrap();
+        let lines = request_lines(task, &recorded).await;
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(results.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_zero_timeout_still_issues_exactly_one_request() {
+        let (addr, recorded, task) = recording_server(vec![
+            Page::ok(json_page(1, 1)),
+            Page::ok(json_page(1, 2)),
+            Page::ok(json_page(1, 3)),
+        ])
+        .await;
+        let endpoint = format!("{addr}/search");
+        let e = JsonApi::from_config(
+            "api",
+            &config(&[
+                ("endpoint", &endpoint),
+                ("page_param", "page"),
+                ("max_pages", "3"),
+            ]),
+            "test/1",
+        )
+        .unwrap();
+        // An exhausted budget must not fan out into a `max_pages` request
+        // burst. At most one request is attempted, and no second page is ever
+        // started; whether that one request even reaches the server before the
+        // zero timeout aborts it is a race, so only the upper bound is asserted.
+        let _ = e.search("rust", 100, Duration::ZERO).await;
+        let lines = request_lines(task, &recorded).await;
+        assert!(lines.len() <= 1, "{lines:?}");
+    }
+
+    #[tokio::test]
+    async fn the_combined_list_is_truncated_to_limit() {
+        let (addr, recorded, task) = recording_server(vec![
+            Page::ok(json_page(10, 1)),
+            Page::ok(json_page(10, 11)),
+            Page::ok(json_page(10, 21)),
+        ])
+        .await;
+        let endpoint = format!("{addr}/search");
+        let e = JsonApi::from_config(
+            "api",
+            &config(&[
+                ("endpoint", &endpoint),
+                ("page_param", "page"),
+                ("max_pages", "3"),
+            ]),
+            "test/1",
+        )
+        .unwrap();
+        let results = e.search("rust", 25, Duration::from_secs(5)).await.unwrap();
+        let lines = request_lines(task, &recorded).await;
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert_eq!(results.len(), 25);
+        // Order is preserved across pages: the last kept entry is the 5th item
+        // of page 3.
+        assert_eq!(results[24].title, "T25");
+    }
+
+    #[tokio::test]
+    async fn repeated_results_are_deduplicated_keeping_first_occurrence() {
+        // Page 2 repeats page 1 and adds one; page 3 is disjoint.
+        let (addr, recorded, task) = recording_server(vec![
+            Page::ok(json_page(3, 1)),
+            Page::ok(json_page(4, 1)),
+            Page::ok(json_page(1, 5)),
+        ])
+        .await;
+        let endpoint = format!("{addr}/search");
+        let e = JsonApi::from_config(
+            "api",
+            &config(&[
+                ("endpoint", &endpoint),
+                ("page_param", "page"),
+                ("max_pages", "3"),
+            ]),
+            "test/1",
+        )
+        .unwrap();
+        let results = e.search("rust", 10, Duration::from_secs(5)).await.unwrap();
+        let lines = request_lines(task, &recorded).await;
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert_eq!(
+            results.iter().map(|r| r.title.as_str()).collect::<Vec<_>>(),
+            ["T1", "T2", "T3", "T4", "T5"]
+        );
+
+        // A provider that repeats its last page when exhausted (Bing) adds
+        // nothing on page 2, which ends the loop.
+        let (addr, recorded, task) = recording_server(vec![
+            Page::ok(json_page(3, 1)),
+            Page::ok(json_page(3, 1)),
+            Page::ok(json_page(1, 9)),
+        ])
+        .await;
+        let endpoint = format!("{addr}/search");
+        let e = JsonApi::from_config(
+            "api",
+            &config(&[
+                ("endpoint", &endpoint),
+                ("page_param", "page"),
+                ("max_pages", "3"),
+            ]),
+            "test/1",
+        )
+        .unwrap();
+        let results = e.search("rust", 10, Duration::from_secs(5)).await.unwrap();
+        assert_eq!(request_lines(task, &recorded).await.len(), 2);
+        assert_eq!(
+            results.iter().map(|r| r.title.as_str()).collect::<Vec<_>>(),
+            ["T1", "T2", "T3"]
+        );
+    }
+
+    #[tokio::test]
+    async fn max_limit_still_clamps_every_page_request() {
+        let (addr, recorded, task) = recording_server(vec![
+            Page::ok(json_page(3, 1)),
+            Page::ok(json_page(3, 4)),
+            Page::ok(json_page(3, 7)),
+        ])
+        .await;
+        let endpoint = format!("{addr}/search");
+        let e = JsonApi::from_config(
+            "api",
+            &config(&[
+                ("endpoint", &endpoint),
+                ("limit_param", "size"),
+                ("max_limit", "10"),
+                ("page_param", "offset"),
+                ("max_pages", "3"),
+            ]),
+            "test/1",
+        )
+        .unwrap();
+        let results = e.search("rust", 50, Duration::from_secs(5)).await.unwrap();
+        let lines = request_lines(task, &recorded).await;
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        for (line, offset) in lines.iter().zip(["1", "2", "3"]) {
+            assert!(line.contains("&size=10&"), "{line}");
+            assert!(
+                line.ends_with(&format!("&offset={offset} HTTP/1.1")),
+                "{line}"
+            );
+        }
+        assert_eq!(results.len(), 9);
+    }
+
+    #[tokio::test]
+    async fn a_full_page_at_the_max_limit_cap_does_not_end_the_loop() {
+        // A real provider fills the page it is asked for, so page 1 returns
+        // exactly `max_limit` items. `max_limit` caps the *page size*; the
+        // running total is compared against the caller's `limit`, so the
+        // guardrail must not trip here and paging must reach page 2 and 3.
+        let (addr, recorded, task) = recording_server(vec![
+            Page::ok(json_page(10, 1)),
+            Page::ok(json_page(10, 11)),
+            Page::ok(json_page(10, 21)),
+        ])
+        .await;
+        let endpoint = format!("{addr}/search");
+        let e = JsonApi::from_config(
+            "api",
+            &config(&[
+                ("endpoint", &endpoint),
+                ("limit_param", "size"),
+                ("max_limit", "10"),
+                ("page_param", "from"),
+                ("page_start", "0"),
+                ("page_step", "10"),
+                ("max_pages", "3"),
+            ]),
+            "test/1",
+        )
+        .unwrap();
+        let results = e.search("rust", 25, Duration::from_secs(5)).await.unwrap();
+        let lines = request_lines(task, &recorded).await;
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        for (line, from) in lines.iter().zip(["0", "10", "20"]) {
+            // The per-request page size is still clamped to `max_limit` ...
+            assert!(line.contains("&size=10&"), "{line}");
+            assert!(line.ends_with(&format!("&from={from} HTTP/1.1")), "{line}");
+        }
+        // ... while the total accumulates past it and is truncated to the
+        // caller's `limit` instead of to the page cap.
+        assert_eq!(results.len(), 25);
+        assert!(results.len() > 10, "the total must exceed the page cap");
+    }
+
+    #[tokio::test]
+    async fn a_max_limit_page_still_satisfies_a_smaller_limit_in_one_request() {
+        // The other half of the guardrail: a page that fills `max_limit` also
+        // satisfies a caller's `limit` below it, so exactly one request is made.
+        let (addr, recorded, task) = recording_server(vec![
+            Page::ok(json_page(10, 1)),
+            Page::ok(json_page(10, 11)),
+        ])
+        .await;
+        let endpoint = format!("{addr}/search");
+        let e = JsonApi::from_config(
+            "api",
+            &config(&[
+                ("endpoint", &endpoint),
+                ("limit_param", "size"),
+                ("max_limit", "10"),
+                ("page_param", "from"),
+                ("page_start", "0"),
+                ("page_step", "10"),
+                ("max_pages", "3"),
+            ]),
+            "test/1",
+        )
+        .unwrap();
+        let results = e.search("rust", 5, Duration::from_secs(5)).await.unwrap();
+        let lines = request_lines(task, &recorded).await;
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0], "GET /search?q=rust&size=5&from=0 HTTP/1.1");
+        assert_eq!(results.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn the_shipped_docker_hub_entry_accumulates_past_its_page_cap() {
+        // The exact trace from `docker_hub` (`limit_param = "size"`,
+        // `max_limit = "10"`, upstream `?from=<n*10>`): a caller asking for 30
+        // used to get exactly one request and 10 results.
+        let (addr, recorded, task) = recording_server(vec![
+            Page::ok(docker_page(10, 1)),
+            Page::ok(docker_page(10, 11)),
+            Page::ok(docker_page(10, 21)),
+        ])
+        .await;
+        let mut cfg = crate::config::Config::builtin_defaults().engines["docker_hub"].clone();
+        cfg.params.insert(
+            "endpoint".into(),
+            toml::Value::from(format!("{addr}/api/search/v3/catalog/search")),
+        );
+        cfg.params
+            .insert("page_param".into(), toml::Value::from("from"));
+        cfg.params.insert("page_start".into(), toml::Value::from(0));
+        cfg.params.insert("page_step".into(), toml::Value::from(10));
+        cfg.params.insert("max_pages".into(), toml::Value::from(3));
+        let e = JsonApi::from_config("docker_hub", &cfg, "test/1").unwrap();
+        let results = e.search("rust", 30, Duration::from_secs(5)).await.unwrap();
+        let lines = request_lines(task, &recorded).await;
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        for (line, from) in lines.iter().zip(["0", "10", "20"]) {
+            assert!(line.contains("&size=10&"), "{line}");
+            assert!(line.ends_with(&format!("&from={from} HTTP/1.1")), "{line}");
+        }
+        assert_eq!(results.len(), 30);
+        assert_eq!(results[29].title, "image30");
+    }
+
+    #[tokio::test]
+    async fn a_max_limit_page_loop_still_obeys_the_shared_deadline() {
+        let (addr, recorded, task) = recording_server(vec![
+            Page::slow(json_page(2, 1), Duration::from_millis(400)),
+            Page::ok(json_page(2, 3)),
+        ])
+        .await;
+        let endpoint = format!("{addr}/search");
+        let e = JsonApi::from_config(
+            "api",
+            &config(&[
+                ("endpoint", &endpoint),
+                ("limit_param", "size"),
+                ("max_limit", "10"),
+                ("page_param", "from"),
+                ("page_start", "0"),
+                ("page_step", "10"),
+                ("max_pages", "3"),
+            ]),
+            "test/1",
+        )
+        .unwrap();
+        // Same budget arithmetic as the un-capped deadline test: 400 ms spent
+        // on page 1 leaves 200 ms, below the 500 ms floor, so page 2 is never
+        // started even though 8 more results are still wanted.
+        let results = e
+            .search("rust", 30, Duration::from_millis(600))
+            .await
+            .expect("page 1 results are still returned");
+        let lines = request_lines(task, &recorded).await;
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn paging_accepts_native_toml_booleans_and_integers() {
+        let config = crate::config::Config::from_toml_str(
+            r#"
+[engines.api]
+type = "json_api"
+endpoint = "https://example.test/search"
+page_param = "offset"
+page_start = 0
+page_step = 20
+max_pages = 4
+"#,
+        )
+        .unwrap();
+        let e = JsonApi::from_config("api", &config.engines["api"], "test/1").unwrap();
+        assert_eq!(e.paging.param(), Some("offset"));
+        assert_eq!(e.paging.max_pages(), 4);
+        assert_eq!(e.paging.page_for(1), Some(0));
+        assert_eq!(e.paging.page_for(3), Some(40));
+        assert_eq!(e.paging.first_page(), None);
+        assert_eq!(
+            e.request_params("q", 5, e.paging.page_for(2)),
+            vec![
+                ("q".to_string(), "q".to_string()),
+                ("offset".to_string(), "20".to_string()),
+            ]
+        );
+
+        let config = crate::config::Config::from_toml_str(
+            r#"
+[engines.api]
+type = "json_api"
+endpoint = "https://example.test/search/{page}"
+page_in_path = true
+page_start = 0
+page_step = 10
+max_pages = 4
+"#,
+        )
+        .unwrap();
+        let e = JsonApi::from_config("api", &config.engines["api"], "test/1").unwrap();
+        assert_eq!(e.paging.first_page(), Some(0));
+        assert_eq!(e.paging.param(), None);
+    }
+
+    #[tokio::test]
+    async fn page_in_path_substitutes_decimal_digits_into_the_path() {
+        for (template, start, step, expected) in [
+            (
+                "https://kickass.to/usearch/{query}/{page}/",
+                "1",
+                "35",
+                [
+                    "/usearch/a%2Fb/1/",
+                    "/usearch/a%2Fb/36/",
+                    "/usearch/a%2Fb/71/",
+                ],
+            ),
+            (
+                "https://x.test/search/{query}/page/{page}/",
+                "1",
+                "35",
+                [
+                    "/search/a%2Fb/page/1/",
+                    "/search/a%2Fb/page/36/",
+                    "/search/a%2Fb/page/71/",
+                ],
+            ),
+            (
+                "https://stocksnap.io/api/search-photos/{query}/relevance/desc/{page}",
+                "1",
+                "35",
+                [
+                    "/api/search-photos/a%2Fb/relevance/desc/1",
+                    "/api/search-photos/a%2Fb/relevance/desc/36",
+                    "/api/search-photos/a%2Fb/relevance/desc/71",
+                ],
+            ),
+            // An offset in a path segment: page 1 is 0, never -10.
+            (
+                "https://x.test/{query}/{page}",
+                "0",
+                "10",
+                ["/a%2Fb/0", "/a%2Fb/10", "/a%2Fb/20"],
+            ),
+        ] {
+            // A local server is required for the absolute template, so the
+            // host is replaced while the path template is kept as it is.
+            let (addr, recorded, task) = recording_server(vec![
+                Page::ok(json_page(1, 1)),
+                Page::ok(json_page(1, 2)),
+                Page::ok(json_page(1, 3)),
+            ])
+            .await;
+            let suffix = template
+                .split_once("://")
+                .and_then(|(_, rest)| rest.find('/').map(|at| &rest[at..]))
+                .unwrap_or("");
+            let endpoint = format!("{addr}{suffix}");
+            let e = JsonApi::from_config(
+                "api",
+                &config(&[
+                    ("endpoint", &endpoint),
+                    ("path_query", "true"),
+                    ("page_in_path", "true"),
+                    ("page_start", start),
+                    ("page_step", step),
+                    ("max_pages", "3"),
+                ]),
+                "test/1",
+            )
+            .unwrap_or_else(|error| panic!("{template}: {error}"));
+            let results = e.search("a/b", 100, Duration::from_secs(5)).await.unwrap();
+            let lines = request_lines(task, &recorded).await;
+            assert_eq!(lines.len(), 3, "{template}: {lines:?}");
+            for (line, want) in lines.iter().zip(expected) {
+                assert!(line.starts_with(&format!("GET {want} HTTP/1.1")), "{line}");
+            }
+            assert_eq!(results.len(), 3, "{template}");
+        }
+    }
+
+    #[test]
+    fn a_page_value_can_never_inject_a_path_segment() {
+        // The page value goes through the same unreserved-set encoding as the
+        // search term, so it cannot add a segment, query or fragment even if a
+        // future refactor made it string-sourced.
+        for (template, query, page, expected) in [
+            ("https://x.test/{page}", "q", Some(36), "https://x.test/36"),
+            ("https://x.test/{page}", "q", Some(0), "https://x.test/0"),
+            ("https://x.test/{page}", "q", Some(1), "https://x.test/1"),
+            (
+                "https://x.test/{query}/{page}",
+                "a/b",
+                Some(36),
+                "https://x.test/a%2Fb/36",
+            ),
+            (
+                "https://x.test/{page}?x=1",
+                "q",
+                Some(36),
+                "https://x.test/36?x=1",
+            ),
+        ] {
+            let url = resolve_endpoint(template, true, query, page).unwrap();
+            assert_eq!(url.as_str(), expected, "{template}");
+        }
+        // An unsubstituted placeholder is silently rewritten to `%7Bpage%7D`,
+        // which is exactly why a `{page}` endpoint must be rejected when
+        // `page_in_path` is off.
+        assert_eq!(
+            resolve_endpoint("https://x.test/{page}", false, "q", None)
+                .unwrap()
+                .as_str(),
+            "https://x.test/%7Bpage%7D"
+        );
+    }
+
+    #[test]
+    fn rejects_inconsistent_paging_configuration() {
+        for (params, expected) in [
+            // `page_param` and `page_in_path` are mutually exclusive, and this
+            // is reported before the missing `{page}` placeholder.
+            (
+                vec![
+                    ("endpoint", "https://example.test/search"),
+                    ("page_param", "first"),
+                    ("page_in_path", "true"),
+                ],
+                "page_param and page_in_path are mutually exclusive",
+            ),
+            // Enabled without a placeholder.
+            (
+                vec![
+                    ("endpoint", "https://example.test/search"),
+                    ("page_in_path", "true"),
+                ],
+                "no {page} placeholder",
+            ),
+            // A placeholder without the flag would ship as a literal.
+            (
+                vec![("endpoint", "https://example.test/{page}")],
+                "page_in_path is not enabled",
+            ),
+            (
+                vec![
+                    ("endpoint", "https://example.test/{page}"),
+                    ("page_in_path", "false"),
+                ],
+                "page_in_path is not enabled",
+            ),
+            // The substituted form is what must parse ...
+            (
+                vec![("endpoint", "not a URL {page}"), ("page_in_path", "true")],
+                "invalid endpoint",
+            ),
+            // ... and what must carry an http(s) scheme. A page value is always
+            // digits, so the substituted scheme cannot come from `{page}`
+            // itself: here it comes from the template around it.
+            (
+                vec![
+                    ("endpoint", "mailto:{page}@example.test"),
+                    ("page_in_path", "true"),
+                ],
+                "must use http or https",
+            ),
+        ] {
+            let error = JsonApi::from_config("api", &config(&params), "test/1")
+                .err()
+                .unwrap_or_else(|| panic!("{params:?} should be rejected"))
+                .to_string();
+            assert!(error.contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_zero_page_step_is_rejected_rather_than_looping_on_page_one() {
+        // A zero step makes every page carry the identical value, so the loop
+        // would spend a second request re-fetching page 1 and never advance.
+        let error = JsonApi::from_config(
+            "api",
+            &config(&[
+                ("endpoint", "https://example.test/search"),
+                ("page_param", "p"),
+                ("page_step", "0"),
+            ]),
+            "test/1",
+        )
+        .err()
+        .expect("page_step = 0 must be rejected")
+        .to_string();
+        assert!(error.contains("page_step must be at least 1"), "{error}");
+
+        // `page_start = 0` stays legal: `docker_hub` sends `from=0` for page 1.
+        assert!(
+            JsonApi::from_config(
+                "api",
+                &config(&[
+                    ("endpoint", "https://example.test/search"),
+                    ("page_param", "from"),
+                    ("page_start", "0"),
+                    ("page_step", "10"),
+                ]),
+                "test/1",
+            )
+            .is_ok(),
+            "page_start = 0 with a positive step must remain valid"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_page_start_or_step_falls_back_to_the_documented_default() {
+        // Same convention as `max_limit`: a value that is negative, non-numeric
+        // or the wrong TOML type falls back to the documented default instead
+        // of failing the whole engine.
+        for (start, step, want_first, want_third) in [
+            // An unreadable `page_start` falls back to 1; step 10 still applies.
+            ("abc", "10", 1, 21),
+            ("-5", "10", 1, 21),
+            // An unreadable `page_step` falls back to 1, so pages step by one
+            // from 0: page 3 is 0 + 2*1 = 2, NOT 0 + 2*10.
+            ("0", "abc", 0, 2),
+            ("0", "-5", 0, 2),
+        ] {
+            let e = JsonApi::from_config(
+                "api",
+                &config(&[
+                    ("endpoint", "https://example.test/search"),
+                    ("page_param", "p"),
+                    ("page_start", start),
+                    ("page_step", step),
+                ]),
+                "test/1",
+            )
+            .unwrap_or_else(|error| panic!("{start}/{step} should be accepted: {error}"));
+            assert_eq!(
+                e.paging.page_for(1),
+                Some(want_first),
+                "page 1 with page_start={start:?} page_step={step:?}"
+            );
+            assert_eq!(
+                e.paging.page_for(3),
+                Some(want_third),
+                "page 3 with page_start={start:?} page_step={step:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn page_param_must_not_collide_with_a_query_or_limit_parameter() {
+        for (params, expected) in [
+            (
+                vec![
+                    ("endpoint", "https://example.test/search"),
+                    ("page_param", "q"),
+                ],
+                Some("collides with a configured query or limit parameter"),
+            ),
+            (
+                vec![
+                    ("endpoint", "https://example.test/search"),
+                    ("query_param", "search"),
+                    ("page_param", "search"),
+                ],
+                Some("collides with a configured query or limit parameter"),
+            ),
+            (
+                vec![
+                    ("endpoint", "https://example.test/search"),
+                    ("limit_param", "size"),
+                    ("page_param", "size"),
+                ],
+                Some("collides with a configured query or limit parameter"),
+            ),
+            (
+                vec![
+                    ("endpoint", "https://example.test/search"),
+                    ("page_param", "safe"),
+                ],
+                None,
+            ),
+        ] {
+            match expected {
+                Some(expected) => {
+                    let error = JsonApi::from_config("api", &config(&params), "test/1")
+                        .err()
+                        .unwrap_or_else(|| panic!("{params:?} should be rejected"))
+                        .to_string();
+                    assert!(error.contains(expected), "{error}");
+                }
+                None => {
+                    JsonApi::from_config("api", &config(&params), "test/1")
+                        .expect("a non-colliding page parameter is accepted");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn page_param_must_not_collide_with_a_key_pinned_in_the_endpoint() {
+        // Twelve shipped endpoints pin their page key literally (`gitea`'s
+        // `?page=1`, `hex`'s `?page=1`, `marginalia`'s `?page=1`, `lemmy`'s
+        // `?page=1`, ...), which is the natural way to enable paging on them.
+        // reqwest's `query()` appends, so the computed value would ship as a
+        // second `page` key, the provider would keep honouring the pinned
+        // first occurrence and the loop would burn `max_pages` requests on
+        // page 1. It is a config error, not a silent precedence.
+        for (endpoint, page_param) in [
+            (
+                "https://gitea.com/api/v1/repos/search?sort=updated&order=desc&page=1",
+                "page",
+            ),
+            (
+                "https://hex.pm/api/packages/?sort=recent_downloads&page=1",
+                "page",
+            ),
+            (
+                "https://api2.marginalia-search.com/search?page=1&nsfw=1",
+                "page",
+            ),
+            (
+                "https://lemmy.ml/api/v3/search?page=1&type_=Communities",
+                "page",
+            ),
+            ("https://example.test/search?offset=0", "offset"),
+            (
+                "https://learn.microsoft.com/api/search?search=rust&$skip=0",
+                "$skip",
+            ),
+        ] {
+            let error = JsonApi::from_config(
+                "gitea",
+                &config(&[
+                    ("endpoint", endpoint),
+                    ("page_param", page_param),
+                    ("max_pages", "3"),
+                ]),
+                "test/1",
+            )
+            .err()
+            .unwrap_or_else(|| panic!("{endpoint} + page_param {page_param} should be rejected"))
+            .to_string();
+            // The message names the engine, the key and the endpoint.
+            assert!(error.contains("engine 'gitea'"), "{error}");
+            assert!(
+                error.contains(&format!("page_param '{page_param}'")),
+                "{error}"
+            );
+            assert!(
+                error.contains("already present in the endpoint's query string"),
+                "{error}"
+            );
+            assert!(error.contains(endpoint), "{error}");
+        }
+
+        // A pinned key that is not the page parameter is not a duplicate.
+        for (endpoint, page_param) in [
+            ("https://example.test/search?nsfw=1", "page"),
+            ("https://hex.pm/api/packages/?pages=1", "page"),
+            // Same key, different case: the wire key is a different one.
+            ("https://example.test/search?Page=1", "page"),
+        ] {
+            JsonApi::from_config(
+                "api",
+                &config(&[("endpoint", endpoint), ("page_param", page_param)]),
+                "test/1",
+            )
+            .unwrap_or_else(|error| panic!("{endpoint} + page_param {page_param}: {error}"));
+        }
+
+        // `page_in_path` appends no query key, so a pinned `page` is fine there.
+        JsonApi::from_config(
+            "api",
+            &config(&[
+                (
+                    "endpoint",
+                    "https://example.test/search/{page}?nsfw=1&page=1",
+                ),
+                ("page_in_path", "true"),
+            ]),
+            "test/1",
+        )
+        .expect("a page in the path never duplicates an endpoint query key");
+
+        // Paging off: the shipped endpoints keep loading unchanged, however
+        // many keys they pin.
+        let config = crate::config::Config::builtin_defaults();
+        for name in ["gitea", "hex", "lemmy"] {
+            JsonApi::from_config(name, &config.engines[name], "test/1")
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_second_page_error_keeps_the_results_collected_so_far() {
+        let (addr, recorded, task) =
+            recording_server(vec![Page::ok(json_page(2, 1)), Page::status(500)]).await;
+        let endpoint = format!("{addr}/search");
+        let e = JsonApi::from_config(
+            "api",
+            &config(&[
+                ("endpoint", &endpoint),
+                ("page_param", "page"),
+                ("max_pages", "3"),
+            ]),
+            "test/1",
+        )
+        .unwrap();
+        let results = e.search("rust", 10, Duration::from_secs(5)).await.unwrap();
+        assert_eq!(request_lines(task, &recorded).await.len(), 2);
+        assert_eq!(results.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_first_page_error_stays_strict_with_paging_on() {
+        let (addr, recorded, task) = recording_server(vec![Page::status(500)]).await;
+        let endpoint = format!("{addr}/search");
+        let e = JsonApi::from_config(
+            "api",
+            &config(&[
+                ("endpoint", &endpoint),
+                ("page_param", "page"),
+                ("max_pages", "3"),
+            ]),
+            "test/1",
+        )
+        .unwrap();
+        assert!(matches!(
+            e.search("rust", 10, Duration::from_secs(5)).await,
+            Err(EngineError::Http(_))
+        ));
+        assert_eq!(request_lines(task, &recorded).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn page_value_arithmetic_saturates_instead_of_overflowing() {
+        let (addr, recorded, task) = recording_server(vec![
+            Page::ok(json_page(1, 1)),
+            Page::ok(json_page(1, 2)),
+            Page::ok(json_page(1, 3)),
+        ])
+        .await;
+        let endpoint = format!("{addr}/search");
+        let e = JsonApi::from_config(
+            "api",
+            &config(&[
+                ("endpoint", &endpoint),
+                ("page_param", "offset"),
+                ("page_start", "18446744073709551615"),
+                ("page_step", "18446744073709551615"),
+                ("max_pages", "3"),
+            ]),
+            "test/1",
+        )
+        .unwrap();
+        let results = e.search("rust", 100, Duration::from_secs(5)).await.unwrap();
+        let lines = request_lines(task, &recorded).await;
+        assert_eq!(results.len(), 3);
+        for line in &lines {
+            assert!(line.contains("offset=18446744073709551615"), "{line}");
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicates_within_the_first_page_are_kept_when_paging_is_off() {
+        // Deduplication is for *cross-page* repeats. With paging off the
+        // output must stay exactly what the single request produced, including
+        // a provider that lists the same URL twice on one page.
+        let (addr, recorded, task) = recording_server(vec![Page::ok(
+            r#"{"results":[
+                {"title":"First","url":"https://example.test/1"},
+                {"title":"Again","url":"https://example.test/1"},
+                {"title":"Second","url":"https://example.test/2"}
+            ]}"#,
+        )])
+        .await;
+        let endpoint = format!("{addr}/search");
+        let e = JsonApi::from_config(
+            "api",
+            &config(&[("endpoint", &endpoint), ("limit_param", "size")]),
+            "test/1",
+        )
+        .unwrap();
+        let results = e.search("rust", 10, Duration::from_secs(5)).await.unwrap();
+        assert_eq!(request_lines(task, &recorded).await.len(), 1);
+        assert_eq!(
+            results.iter().map(|r| r.title.as_str()).collect::<Vec<_>>(),
+            ["First", "Again", "Second"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_zero_limit_still_issues_exactly_one_request() {
+        let (addr, recorded, task) =
+            recording_server(vec![Page::ok(json_page(3, 1)), Page::ok(json_page(3, 4))]).await;
+        let endpoint = format!("{addr}/search");
+        let e = JsonApi::from_config(
+            "api",
+            &config(&[
+                ("endpoint", &endpoint),
+                ("page_param", "offset"),
+                ("page_start", "0"),
+                ("page_step", "10"),
+                ("max_pages", "3"),
+            ]),
+            "test/1",
+        )
+        .unwrap();
+        let results = e.search("rust", 0, Duration::from_secs(5)).await.unwrap();
+        let lines = request_lines(task, &recorded).await;
+        assert_eq!(
+            lines,
+            vec!["GET /search?q=rust&offset=0 HTTP/1.1".to_owned()]
+        );
+        assert!(results.is_empty());
     }
 }
