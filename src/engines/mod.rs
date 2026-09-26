@@ -6,13 +6,80 @@ pub mod html_scrape;
 pub mod json_api;
 pub mod wikipedia;
 
+use std::borrow::Cow;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use reqwest::Url;
 
 use crate::config::EngineConfig;
 use crate::error::EngineResult;
 use crate::models::SearchResult;
+
+/// Literal placeholder replaced by the percent-encoded search term when the
+/// `path_query` option is enabled.
+pub(crate) const QUERY_PLACEHOLDER: &str = "{query}";
+
+/// Stand-in term used to validate a `path_query` endpoint template at
+/// configuration time, before any real query exists.
+pub(crate) const ENDPOINT_PROBE: &str = "probe";
+
+/// Resolve an endpoint template for `query`.
+///
+/// When `path_query` is set, every `{query}` occurrence is replaced with the
+/// percent-encoded search term *in the raw string*, because a literal `{` is
+/// not a valid URL character and `Url::parse` would silently rewrite it to
+/// `%7B`. `urlencoding::encode` escapes every byte outside the RFC 3986
+/// unreserved set (`A-Za-z0-9-._~`, space as `%20`), so a search term can
+/// never add a path segment, a query string, or a fragment. This is stricter
+/// than upstream Python `quote()`, which keeps `/` literal.
+///
+/// Pure by design: it takes no `self`, so a later page-aware change only has
+/// to add a `page` argument and a `{page}` placeholder here. Shared by the
+/// [`json_api`] and [`html_scrape`] adapters so the two can never diverge.
+pub(crate) fn resolve_endpoint(
+    template: &str,
+    path_query: bool,
+    query: &str,
+) -> anyhow::Result<Url> {
+    let resolved = if path_query {
+        let encoded: Cow<'_, str> = urlencoding::encode(query);
+        template.replace(QUERY_PLACEHOLDER, encoded.as_ref())
+    } else {
+        template.to_owned()
+    };
+    Url::parse(&resolved).map_err(Into::into)
+}
+
+/// Validate the `path_query` / `{query}` placeholder combination.
+///
+/// Returns `Err` for the three misconfigurations that would otherwise produce
+/// a silently broken engine: the flag on with no placeholder, the placeholder
+/// present with the flag off, and a template that is not a valid URL once
+/// substituted. With the flag off and no placeholder this is exactly the
+/// pre-existing endpoint parse, so behaviour is unchanged for every config
+/// that does not opt in.
+pub(crate) fn validate_endpoint(
+    name: &str,
+    endpoint: &str,
+    path_query: bool,
+) -> anyhow::Result<Url> {
+    let has_placeholder = endpoint.contains(QUERY_PLACEHOLDER);
+    if path_query && !has_placeholder {
+        anyhow::bail!(
+            "engine '{name}': path_query is enabled but the endpoint has no {QUERY_PLACEHOLDER} placeholder"
+        );
+    }
+    if has_placeholder && !path_query {
+        anyhow::bail!(
+            "engine '{name}': the endpoint has a {QUERY_PLACEHOLDER} placeholder but path_query is not enabled"
+        );
+    }
+    // A `path_query` endpoint is only ever used after substitution, so
+    // validate the substituted form; the raw template is not a URL.
+    resolve_endpoint(endpoint, path_query, ENDPOINT_PROBE)
+        .map_err(|error| anyhow::anyhow!("engine '{name}': invalid endpoint: {error}"))
+}
 
 /// A search backend. Implementations translate a query into normalized
 /// results and must never attempt to defeat bot protection: no CAPTCHA
